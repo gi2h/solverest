@@ -23,7 +23,6 @@ COPY requirements.txt /app/requirements-root.txt
 
 # ── Extract arsip.zip (flatten single top-level folder if present) ──
 COPY arsip.zip /tmp/arsip.zip
-COPY app.py /app/app.py
 RUN set -eux; \
     unzip -q /tmp/arsip.zip -d /tmp/x; \
     count=$(ls /tmp/x | wc -l); \
@@ -63,6 +62,7 @@ RUN set -eux; \
     fi
 
 # ── Entrypoint ──────────────────────────────────────────────────────
+COPY app.py /app/app.py
 COPY start.sh /start.sh
 RUN chmod +x /start.sh
 
