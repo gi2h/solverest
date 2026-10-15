@@ -1,99 +1,49 @@
 #!/bin/sh
 # ═══════════════════════════════════════════════════════════════════════
-# Fortress Captcha — start dispatcher
-# Reads $SERVICE, runs the matching process. Supports both OLD and NEW
-# service naming (e.g. altcha-solver | altcha-service | altcha).
+# Fortress Captcha — Service Dispatcher
+# Supports structure: services/<name>/ + workers/ at root
 # ═══════════════════════════════════════════════════════════════════════
 set -e
 
 SERVICE="${SERVICE:-api-gateway}"
-echo "[start] SERVICE=$SERVICE  PORT=${PORT:-unset}  PWD=$(pwd)"
+echo "[start] SERVICE=$SERVICE PORT=${PORT:-unset} PWD=$(pwd)"
 
-# ── Locate the service directory ───────────────────────────────────────
-find_dir() {
-    for d in \
-        "services/$1" \
-        "services/$1-service" \
-        "services/$1-solver" \
-        "services/${1%-service}" \
-        "services/${1%-solver}" \
-        "$1"
-    do
-        [ -d "$d" ] && { echo "$d"; return 0; }
-    done
-    return 1
+# ── Run a FastAPI service from a directory ──────────────────────────
+run_uvicorn() {
+    dir="$1"; default_port="$2"
+    port="${PORT:-$default_port}"
+    cd "/app/$dir" || { echo "[start] FATAL: no dir /app/$dir" >&2; exit 1; }
+    APP="main:app"
+    [ -f "app/main.py" ] && APP="app.main:app"
+    echo "[start] cd $dir → uvicorn $APP :$port"
+    exec uvicorn "$APP" --host 0.0.0.0 --port "$port" --workers 1
 }
 
-# ── Locate uvicorn app entrypoint ──────────────────────────────────────
-find_app() {
-    if [ -f "app/main.py" ]; then echo "app.main:app"; return 0; fi
-    if [ -f "main.py" ];     then echo "main:app";     return 0; fi
-    if [ -f "server.py" ];   then echo "server:app";   return 0; fi
-    return 1
-}
-
-SVC_DIR=$(find_dir "$SERVICE") || {
-    echo "[start] FATAL: cannot find directory for SERVICE='$SERVICE'" >&2
-    echo "[start] available under services/:" >&2
-    ls -1 services/ 2>/dev/null >&2 || echo "  (none)" >&2
-    exit 1
-}
-echo "[start] resolved dir: $SVC_DIR"
-cd "$SVC_DIR"
-
-# ── Dispatch ───────────────────────────────────────────────────────────
+# ── Dispatch ────────────────────────────────────────────────────────
 case "$SERVICE" in
     api-gateway|gateway)
-        APP=$(find_app) || { echo "no app entry in $(pwd)" >&2; exit 1; }
-        echo "[start] running uvicorn $APP on :${PORT:-8080}"
-        exec uvicorn "$APP" --host 0.0.0.0 --port "${PORT:-8080}" --workers 1
-        ;;
+        run_uvicorn "services/api-gateway" 8080 ;;
 
-    worker|image-worker|token-worker)
-        # Worker serves its own /health on $PORT and consumes streams.
-        if [ -f "app/worker.py" ]; then
-            exec python -m app.worker
-        elif [ -f "worker.py" ]; then
-            exec python worker.py
-        elif [ -f "base_worker.py" ]; then
-            exec python base_worker.py
-        else
-            echo "[start] no worker entry found in $(pwd)" >&2
-            ls -la >&2
-            exit 1
-        fi
-        ;;
+    altcha|altcha-service|altcha-solver)
+        run_uvicorn "services/altcha-service" 9005 ;;
 
-    altcha|altcha-solver|altcha-service)
-        APP=$(find_app) || { echo "no app entry" >&2; exit 1; }
-        exec uvicorn "$APP" --host 0.0.0.0 --port "${PORT:-9005}"
-        ;;
+    friendly|friendly-service|friendly-solver)
+        run_uvicorn "services/friendly-service" 9006 ;;
 
-    friendly|friendly-solver|friendly-service)
-        APP=$(find_app) || { echo "no app entry" >&2; exit 1; }
-        exec uvicorn "$APP" --host 0.0.0.0 --port "${PORT:-9006}"
-        ;;
+    ocr|ocr-service|ocr-solver)
+        run_uvicorn "services/ocr-service" 9003 ;;
 
-    ocr|ocr-solver|ocr-service)
-        APP=$(find_app) || { echo "no app entry" >&2; exit 1; }
-        exec uvicorn "$APP" --host 0.0.0.0 --port "${PORT:-9003}"
-        ;;
+    router|router-service)
+        run_uvicorn "services/router-service" 9007 ;;
 
-    cloak|cloak-solver|cloak-service)
-        APP=$(find_app) || { echo "no app entry" >&2; exit 1; }
-        exec uvicorn "$APP" --host 0.0.0.0 --port "${PORT:-9001}"
-        ;;
+    cloak|cloak-service)
+        run_uvicorn "services/cloak-service" 9001 ;;
 
-    router|router-solver|router-service)
-        APP=$(find_app) || { echo "no app entry" >&2; exit 1; }
-        exec uvicorn "$APP" --host 0.0.0.0 --port "${PORT:-9007}"
-        ;;
-
-    vision|vision-solver|vision-service)
+    vision|vision-service|vision-solver)
         MODEL_DIR="${QWEN_LOCAL_DIR:-/data/models/qwen}"
         if [ ! -f "$MODEL_DIR/.download-complete" ]; then
-            echo "[start] model not found at $MODEL_DIR — downloading..."
-            python - <<'PYEOF' || echo "[start] WARN: model download failed (service will start with model=null)"
+            echo "[start] downloading Qwen model → $MODEL_DIR (first boot only)"
+            python - <<'PYEOF' || echo "[start] WARN: model download failed, continuing"
 import os, sys
 from pathlib import Path
 try:
@@ -102,27 +52,73 @@ except ImportError:
     print("[dl] huggingface_hub not installed", file=sys.stderr); sys.exit(1)
 dest = Path(os.environ.get("QWEN_LOCAL_DIR", "/data/models/qwen"))
 dest.mkdir(parents=True, exist_ok=True)
-repo = os.environ.get("QWEN_REPO", "Qwen/Qwen3-VL-2B-Instruct")
+repo = os.environ.get("QWEN_REPO", "Qwen/Qwen2-VL-2B-Instruct")
 token = os.environ.get("HF_TOKEN") or None
-print(f"[dl] repo={repo} dest={dest}")
+print(f"[dl] {repo} → {dest}")
 try:
     snapshot_download(repo_id=repo, local_dir=str(dest), token=token,
                       ignore_patterns=["*.msgpack","*.h5","*.ot","*.tflite","*.onnx"])
+    (dest / ".download-complete").touch()
     print("[dl] OK")
 except Exception as e:
     print(f"[dl] FAILED: {e}", file=sys.stderr); sys.exit(1)
 PYEOF
-            touch "$MODEL_DIR/.download-complete" 2>/dev/null || true
         else
-            echo "[start] model already present at $MODEL_DIR"
+            echo "[start] model present at $MODEL_DIR"
         fi
-        APP=$(find_app) || { echo "no app entry" >&2; exit 1; }
-        exec uvicorn "$APP" --host 0.0.0.0 --port "${PORT:-9002}"
+        run_uvicorn "services/vision-service" 9002 ;;
+
+    worker|image-worker|token-worker|cleanup-worker)
+        cd /app
+        echo "[start] starting worker (health shim on :${PORT:-8080})"
+        exec python - <<'PYEOF'
+import importlib, os, sys, threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
+
+class H(BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path == "/health":
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(b'{"status":"ok","role":"worker"}')
+        else:
+            self.send_response(404); self.end_headers()
+    def log_message(self, *a): pass
+
+def serve():
+    port = int(os.environ.get("PORT", "8080"))
+    HTTPServer(("0.0.0.0", port), H).serve_forever()
+
+threading.Thread(target=serve, daemon=True).start()
+print("[worker] health shim listening on", os.environ.get("PORT", "8080"), flush=True)
+
+svc = os.environ.get("SERVICE", "worker")
+try:
+    if svc == "token-worker":
+        from workers.token_worker import TokenWorker
+        from workers.base_worker import run_worker
+        run_worker(TokenWorker())
+    elif svc == "cleanup-worker":
+        import asyncio
+        from workers.cleanup_worker import loop
+        asyncio.run(loop())
+    else:
+        from workers.image_worker import ImageWorker
+        from workers.base_worker import run_worker
+        run_worker(ImageWorker())
+except ImportError as e:
+    print(f"[worker] import failed: {e}", file=sys.stderr)
+    print("[worker] available files in /app/workers:", file=sys.stderr)
+    import os as _os
+    for f in _os.listdir("/app/workers"):
+        print("  ", f, file=sys.stderr)
+    sys.exit(1)
+PYEOF
         ;;
 
     *)
         echo "[start] FATAL: unknown SERVICE='$SERVICE'" >&2
-        echo "[start] valid values: api-gateway worker altcha friendly ocr cloak router vision" >&2
-        exit 1
-        ;;
+        echo "[start] valid: api-gateway | worker | altcha | friendly | vision | ocr | router | cloak" >&2
+        exit 1 ;;
 esac
