@@ -7,7 +7,7 @@ Semua logic ada di turnstile_solver.py (FastAPI app self-contained).
 
 import os
 import uvicorn
-from turnstile_solver import app
+from turnstile_solver1 import app
 
 if __name__ == "__main__":
     uvicorn.run(
