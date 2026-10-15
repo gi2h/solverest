@@ -1,11 +1,15 @@
 """
-Fortress Captcha API v4.0 - Patchright-based solver.
+Fortress Captcha API v4.1 - Patchright + Xvfb solver.
+
+Changelog v4.1:
+  - Non-headless Chromium via Xvfb (bypass headless detection)
+  - Stealth JS init script injected before page load
+  - New /v1/debug/turnstile endpoint (screenshot + iframe list)
+  - Better error messages with debug info
 
 Changelog v4.0:
-  - Replaced FlareSolverr with Patchright (real browser interaksi)
-  - Turnstile widget solving via real mouse click in Chromium
-  - Cloudflare cookie fetch via real navigation
-  - Single-process (no supervisord)
+  - Patchright-based solver (real browser interaksi)
+  - Drop FlareSolverr entirely
 
 Endpoints:
   POST /solve                    -> legacy CapSkip-compatible
@@ -15,10 +19,10 @@ Endpoints:
   POST /v1/solve/turnstile       -> async Turnstile (Patchright)
   POST /v1/solve/recaptcha       -> async reCAPTCHA v2 (Patchright)
   GET  /v1/solve/cloudflare      -> cookies + UA via Patchright
+  POST /v1/debug/turnstile       -> debug: screenshot + iframe list
   GET  /v1/tasks/{id}            -> task status
   GET  /v1/tasks/{id}/wait       -> long-poll
-  DELETE /v1/tasks/{id}          -> delete
-  GET  /v1/debug/turnstile       -> debug: fetch raw HTML via Patchright
+  DELETE /v1/tasks/{id}          -> delete task
   GET  /health                   -> health check
   GET  /                         -> API info
 """
@@ -27,8 +31,8 @@ from __future__ import annotations
 import asyncio
 import base64
 import hashlib
-import logging
 import json
+import logging
 import os
 import struct
 import time
@@ -61,7 +65,7 @@ VISION_URL = os.getenv(
     "VISION_URL", "http://vision-solver.railway.internal:9002"
 )
 TASK_TTL = int(os.getenv("TASK_TTL_SECONDS", "3600"))
-MAX_CONCURRENT = int(os.getenv("MAX_CONCURRENT_SOLVES", "4"))
+MAX_CONCURRENT = int(os.getenv("MAX_CONCURRENT_SOLVES", "2"))
 SOLVE_TIMEOUT = int(os.getenv("SOLVE_TIMEOUT", "180"))
 BROWSER_TIMEOUT = int(os.getenv("BROWSER_TIMEOUT", "90"))
 API_KEY = os.getenv("API_KEY", "")
@@ -241,7 +245,7 @@ async def _solve_image_via_vision(image_b64: str, hint: Optional[str]) -> str:
 # BROWSER SOLVER WRAPPER
 # =====================================================================
 def _run_async_in_thread(coro):
-    """Run an async coroutine in a separate thread with its own event loop."""
+    """Run an async coroutine in a new event loop (from a worker thread)."""
     loop = asyncio.new_event_loop()
     try:
         return loop.run_until_complete(coro)
@@ -264,7 +268,7 @@ async def _run_browser_task(
                     pageurl=pageurl,
                     timeout=BROWSER_TIMEOUT,
                     proxy=proxy,
-                    headless=True,
+                    headless=False,  # Xvfb
                 )
             else:
                 coro = solve_recaptcha(
@@ -272,12 +276,20 @@ async def _run_browser_task(
                     pageurl=pageurl,
                     timeout=BROWSER_TIMEOUT,
                     proxy=proxy,
-                    headless=True,
+                    headless=False,
                 )
 
-            token = await asyncio.get_event_loop().run_in_executor(
+            result = await asyncio.get_event_loop().run_in_executor(
                 None, _run_async_in_thread, coro,
             )
+            if isinstance(result, dict):
+                token = result.get("token", "")
+            else:
+                token = str(result)
+
+            if not token:
+                raise RuntimeError("solver_returned_empty_token")
+
             await store.update(
                 tid, status="done", result=token,
                 elapsed_ms=int((time.time() - t0) * 1000),
@@ -312,12 +324,19 @@ async def _run_image_task(tid: str, image_b64: str, hint: Optional[str]):
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await store.start()
-    print("[app] started | version=4.0.0 | solver=patchright", flush=True)
+    print(
+        "[app] started | version=4.1.0 | solver=patchright+xvfb",
+        flush=True,
+    )
     yield
     await store.stop()
 
 
-app = FastAPI(title="Fortress Captcha API", version="4.0.0", lifespan=lifespan)
+app = FastAPI(
+    title="Fortress Captcha API",
+    version="4.1.0",
+    lifespan=lifespan,
+)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -347,8 +366,8 @@ def require_api_key(request: Request):
 async def root():
     return {
         "service": "fortress-captcha",
-        "version": "4.0.0",
-        "solver": "patchright",
+        "version": "4.1.0",
+        "solver": "patchright+xvfb",
         "auth_required": bool(API_KEY),
         "capabilities": {
             "altcha": True,
@@ -370,6 +389,7 @@ async def root():
                 "POST /v1/solve/recaptcha",
             ],
             "cookie": ["GET /v1/solve/cloudflare?url=..."],
+            "debug": ["POST /v1/debug/turnstile"],
             "tasks": [
                 "GET /v1/tasks/{id}",
                 "GET /v1/tasks/{id}/wait",
@@ -394,7 +414,7 @@ async def health():
         )
     return {
         "status": "ok",
-        "solver": "patchright",
+        "solver": "patchright+xvfb",
         "tasks": {
             "total": len(store._tasks),
             "pending": pending, "done": done, "failed": failed,
@@ -408,7 +428,9 @@ async def health():
 # SYNC SOLVERS
 # =====================================================================
 @app.post("/v1/solve/altcha", response_model=AltchaResponse)
-async def solve_altcha(req: AltchaRequest, _=Depends(require_api_key)):
+async def solve_altcha_endpoint(
+    req: AltchaRequest, _=Depends(require_api_key)
+):
     t0 = time.time()
     try:
         sol, iters = await asyncio.get_event_loop().run_in_executor(
@@ -423,7 +445,9 @@ async def solve_altcha(req: AltchaRequest, _=Depends(require_api_key)):
 
 
 @app.post("/v1/solve/friendly", response_model=FriendlyResponse)
-async def solve_friendly(req: FriendlyRequest, _=Depends(require_api_key)):
+async def solve_friendly_endpoint(
+    req: FriendlyRequest, _=Depends(require_api_key)
+):
     t0 = time.time()
     try:
         sol, nonce = await asyncio.get_event_loop().run_in_executor(
@@ -498,7 +522,7 @@ async def solve_cloudflare(
             None,
             _run_async_in_thread,
             get_cloudflare_cookie(
-                url=url, timeout=60, proxy=proxy, headless=True,
+                url=url, timeout=60, proxy=proxy, headless=False,
             ),
         )
     except Exception as e:
@@ -518,6 +542,41 @@ async def solve_cloudflare(
         "html_length": len(result.get("html", "")),
         "final_url": result.get("final_url", url),
     }
+
+
+# =====================================================================
+# DEBUG ENDPOINTS
+# =====================================================================
+@app.post("/v1/debug/turnstile")
+async def debug_turnstile(
+    body: dict = Body(...),
+    _=Depends(require_api_key),
+):
+    """
+    Debug Turnstile: return screenshot + iframe list + console logs.
+    Body: {"sitekey": "0x...", "pageurl": "https://...", "timeout": 30}
+    """
+    sitekey = body.get("sitekey", "")
+    pageurl = body.get("pageurl", "")
+    timeout = int(body.get("timeout", 30))
+
+    if not pageurl:
+        raise HTTPException(400, "pageurl_required")
+
+    try:
+        result = await asyncio.get_event_loop().run_in_executor(
+            None,
+            _run_async_in_thread,
+            solve_turnstile(
+                sitekey=sitekey or "0x0",
+                pageurl=pageurl,
+                timeout=timeout,
+                headless=False,
+            ),
+        )
+        return {"status": "ok", "result": result}
+    except Exception as e:
+        return {"status": "error", "error": str(e)[:800]}
 
 
 # =====================================================================
@@ -766,15 +825,18 @@ async def legacy_solve(body: dict = Body(...)):
 async def test_page():
     from fastapi.responses import HTMLResponse
     return HTMLResponse(content=(
-        "<!doctype html><html><head><title>Fortress v4</title></head>"
-        "<body><h1>Fortress Captcha v4.0</h1>"
-        "<p>Patchright-based solver</p>"
+        "<!doctype html><html><head><title>Fortress v4.1</title></head>"
+        "<body><h1>Fortress Captcha v4.1</h1>"
+        "<p>Patchright + Xvfb solver</p>"
         "<p><a href='/health'>/health</a> | <a href='/'>/</a> | "
         "<a href='/docs'>/docs</a></p>"
         "</body></html>"
     ))
 
 
+# =====================================================================
+# DIRECT RUN
+# =====================================================================
 if __name__ == "__main__":
     import uvicorn
     port = int(os.getenv("PORT", "8080"))
