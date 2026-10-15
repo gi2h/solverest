@@ -1,4 +1,11 @@
+# ═══════════════════════════════════════════════════════════════════════
+# FORTRESS CAPTCHA - All-in-one (fix: non-root base image)
+# ═══════════════════════════════════════════════════════════════════════
 FROM ghcr.io/flaresolverr/flaresolverr:latest
+
+# FlareSolverr image runs as non-root user by default.
+# Switch to root to allow COPY + chmod + supervisord setup.
+USER root
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
@@ -10,16 +17,19 @@ ENV PYTHONUNBUFFERED=1 \
 
 WORKDIR /solver
 
+# Python deps for api-gateway + supervisor (no apt-get, pip only)
 COPY requirements.txt /solver/requirements.txt
 RUN pip install --no-cache-dir supervisor==4.2.5 \
  && pip install --no-cache-dir -r /solver/requirements.txt
 
+# App files
 COPY app.py /solver/app.py
 COPY start.sh /solver/start.sh
 COPY supervisord.conf /solver/supervisord.conf
-RUN chmod +x /solver/start.sh
 
-RUN mkdir -p /var/log/supervisor /var/run
+# Ensure start.sh is executable (works because we're root now)
+RUN chmod 755 /solver/start.sh \
+ && mkdir -p /var/log/supervisor /var/run
 
 EXPOSE 8080
 
