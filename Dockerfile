@@ -1,70 +1,47 @@
 # ═══════════════════════════════════════════════════════════════════════
-# FORTRESS CAPTCHA — Universal Dockerfile
-# Extracts arsip.zip, patches symlinks, installs deps, dispatches via start.sh
+# FORTRESS CAPTCHA - All-in-one
+# Base: FlareSolverr image (Python 3.11 + Chromium + chromedriver)
+# Adds: api-gateway (app.py) via supervisord
+# Runs: flaresolverr on 127.0.0.1:8191 + uvicorn on 0.0.0.0:$PORT
 # ═══════════════════════════════════════════════════════════════════════
-FROM python:3.12-slim
+FROM ghcr.io/flaresolverr/flaresolverr:latest
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PIP_NO_CACHE_DIR=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
-    PYTHONPATH=/app \
+    PYTHONPATH=/solver \
+    FLARESOLVERR_ENABLED=1 \
+    FLARESOLVERR_URL=http://127.0.0.1:8191 \
     DEBIAN_FRONTEND=noninteractive
 
-# ── System packages ─────────────────────────────────────────────────
+# ── System packages: supervisor + utilities ─────────────────────────────
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        unzip curl ca-certificates \
+        supervisor unzip curl ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-WORKDIR /app
+# ── Our app in /solver (FlareSolverr stays in /app) ─────────────────────
+WORKDIR /solver
 
-# ── Save root requirements as fallback ──────────────────────────────
-COPY requirements.txt /app/requirements-root.txt
+# Python deps for app.py
+COPY requirements.txt /solver/requirements.txt
+RUN pip install --no-cache-dir -r /solver/requirements.txt
 
-# ── Extract arsip.zip (flatten single top-level folder if present) ──
+# App files
+COPY app.py /solver/app.py
+COPY start.sh /solver/start.sh
+COPY supervisord.conf /solver/supervisord.conf
+RUN chmod +x /solver/start.sh
+
+# arsip.zip optional (untuk vision-solver legacy, kalau ada)
 COPY arsip.zip /tmp/arsip.zip
-RUN set -eux; \
-    unzip -q /tmp/arsip.zip -d /tmp/x; \
-    count=$(ls /tmp/x | wc -l); \
-    if [ "$count" = "1" ] && [ -d "/tmp/x/$(ls /tmp/x | head -1)" ]; then \
-        inner="/tmp/x/$(ls /tmp/x | head -1)"; \
-        mv "$inner"/* /app/ 2>/dev/null || true; \
-        mv "$inner"/.[!.]* /app/ 2>/dev/null || true; \
-    else \
-        mv /tmp/x/* /app/ 2>/dev/null || true; \
-        mv /tmp/x/.[!.]* /app/ 2>/dev/null || true; \
-    fi; \
-    rm -rf /tmp/x /tmp/arsip.zip; \
-    echo "--- /app ---"; ls -la /app; \
-    echo "--- /app/services ---"; ls -la /app/services 2>/dev/null || echo "no services dir"; \
-    echo "--- /app/workers ---"; ls -la /app/workers 2>/dev/null || echo "no workers dir"
 
-# ── Create underscore symlinks for ALL hyphenated service dirs ──────
-# IMPORTANT: uses *-* (not just *-service *-solver) so api-gateway,
-# router-service, etc. all get their underscore aliases.
-RUN set -eux; \
-    cd /app/services; \
-    for d in *-*; do \
-        [ -d "$d" ] || continue; \
-        under=$(echo "$d" | tr '-' '_'); \
-        [ -e "$under" ] || ln -sf "$d" "$under"; \
-    done; \
-    echo "--- symlinks ---"; ls -la /app/services
-
-# ── Install Python dependencies ─────────────────────────────────────
-RUN set -eux; \
-    if [ -f /app/requirements.txt ]; then \
-        echo "→ installing /app/requirements.txt (from zip)"; \
-        pip install --no-cache-dir -r /app/requirements.txt; \
-    else \
-        echo "→ installing /app/requirements-root.txt (from repo root)"; \
-        pip install --no-cache-dir -r /app/requirements-root.txt; \
-    fi
-
-# ── Entrypoint ──────────────────────────────────────────────────────
-COPY app.py /app/app.py
-COPY start.sh /start.sh
-RUN chmod +x /start.sh
+# ── Supervisor configuration ────────────────────────────────────────────
+RUN mkdir -p /var/log/supervisor /var/run
 
 EXPOSE 8080
-CMD ["/start.sh"]
+
+HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=5 \
+  CMD curl -fsS "http://localhost:${PORT:-8080}/health" || exit 1
+
+CMD ["/usr/bin/supervisord", "-c", "/solver/supervisord.conf"]
