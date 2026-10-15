@@ -1,6 +1,6 @@
 # ═══════════════════════════════════════════════════════════════════════
 # FORTRESS CAPTCHA — Universal Dockerfile
-# Handles both old (workers/ at root) and new structures.
+# Extracts arsip.zip, patches symlinks, installs deps, dispatches via start.sh
 # ═══════════════════════════════════════════════════════════════════════
 FROM python:3.12-slim
 
@@ -11,16 +11,17 @@ ENV PYTHONUNBUFFERED=1 \
     PYTHONPATH=/app \
     DEBIAN_FRONTEND=noninteractive
 
+# ── System packages ─────────────────────────────────────────────────
 RUN apt-get update && apt-get install -y --no-install-recommends \
         unzip curl ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
-# ── Copy root requirements first (better layer caching) ─────────────
+# ── Save root requirements as fallback ──────────────────────────────
 COPY requirements.txt /app/requirements-root.txt
 
-# ── Extract arsip.zip ────────────────────────────────────────────────
+# ── Extract arsip.zip (flatten single top-level folder if present) ──
 COPY arsip.zip /tmp/arsip.zip
 RUN set -eux; \
     unzip -q /tmp/arsip.zip -d /tmp/x; \
@@ -34,11 +35,13 @@ RUN set -eux; \
         mv /tmp/x/.[!.]* /app/ 2>/dev/null || true; \
     fi; \
     rm -rf /tmp/x /tmp/arsip.zip; \
-    ls -la /app; \
-    echo "--- services ---"; ls -la /app/services
+    echo "--- /app ---"; ls -la /app; \
+    echo "--- /app/services ---"; ls -la /app/services 2>/dev/null || echo "no services dir"; \
+    echo "--- /app/workers ---"; ls -la /app/workers 2>/dev/null || echo "no workers dir"
 
 # ── Create underscore symlinks for ALL hyphenated service dirs ──────
-# FIX: match *-* (not just *-service *-solver) so api-gateway also gets one
+# IMPORTANT: uses *-* (not just *-service *-solver) so api-gateway,
+# router-service, etc. all get their underscore aliases.
 RUN set -eux; \
     cd /app/services; \
     for d in *-*; do \
@@ -51,10 +54,10 @@ RUN set -eux; \
 # ── Install Python dependencies ─────────────────────────────────────
 RUN set -eux; \
     if [ -f /app/requirements.txt ]; then \
-        echo "→ installing /app/requirements.txt"; \
+        echo "→ installing /app/requirements.txt (from zip)"; \
         pip install --no-cache-dir -r /app/requirements.txt; \
     else \
-        echo "→ installing /app/requirements-root.txt (from git)"; \
+        echo "→ installing /app/requirements-root.txt (from repo root)"; \
         pip install --no-cache-dir -r /app/requirements-root.txt; \
     fi
 
