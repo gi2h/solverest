@@ -1,8 +1,3 @@
-# ═══════════════════════════════════════════════════════════════════════
-# FORTRESS CAPTCHA - All-in-one
-# Base: FlareSolverr (Python 3.11 + Chromium pre-installed)
-# Adds: api-gateway + supervisor, WITHOUT apt-get (base image broken)
-# ═══════════════════════════════════════════════════════════════════════
 FROM ghcr.io/flaresolverr/flaresolverr:latest
 
 ENV PYTHONUNBUFFERED=1 \
@@ -15,19 +10,14 @@ ENV PYTHONUNBUFFERED=1 \
 
 WORKDIR /solver
 
-# ── Python deps for api-gateway + supervisor ───────────────────────────
 COPY requirements.txt /solver/requirements.txt
 RUN pip install --no-cache-dir supervisor==4.2.5 \
  && pip install --no-cache-dir -r /solver/requirements.txt
 
-# ── App files ──────────────────────────────────────────────────────────
 COPY app.py /solver/app.py
 COPY start.sh /solver/start.sh
 COPY supervisord.conf /solver/supervisord.conf
 RUN chmod +x /solver/start.sh
-
-# ── Optional arsip.zip (untuk legacy services) ─────────────────────────
-COPY arsip.zip /tmp/arsip.zip
 
 RUN mkdir -p /var/log/supervisor /var/run
 
