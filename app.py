@@ -1,22 +1,27 @@
 """
-Fortress Captcha API v3.0 - Self-contained, modern REST + FlareSolverr.
+Fortress Captcha API v3.1 - Full.
+
+Changelog v3.1:
+  - Fixed Turnstile regex extraction (7 patterns + fallback)
+  - Added /v1/debug/flaresolverr endpoint for troubleshooting
+  - HTML entity decode before regex matching
+  - ASCII-safe source (no unicode)
 
 Changelog v3.0:
   - FlareSolverr integration for Turnstile + reCAPTCHA v2
-  - New endpoints: /v1/solve/turnstile, /v1/solve/recaptcha
-  - Legacy /solve support for Turnstile + reCAPTCHA
-  - Health check verifies FlareSolverr reachable
+  - Legacy /solve support for all types
 
 Endpoints:
   POST /solve                    -> legacy CapSkip-compatible
   POST /v1/solve/altcha          -> sync ALTCHA PoW
   POST /v1/solve/friendly        -> sync Friendly Captcha PoW
-  POST /v1/solve/image           -> async image (vision-solver)
-  POST /v1/solve/turnstile       -> async Turnstile (flaresolverr)
-  POST /v1/solve/recaptcha       -> async reCAPTCHA v2 (flaresolverr)
+  POST /v1/solve/image           -> async image
+  POST /v1/solve/turnstile       -> async Turnstile
+  POST /v1/solve/recaptcha       -> async reCAPTCHA v2
   GET  /v1/tasks/{id}            -> task status
   GET  /v1/tasks/{id}/wait       -> long-poll
   DELETE /v1/tasks/{id}          -> delete
+  GET  /v1/debug/flaresolverr    -> raw FlareSolverr HTML dump
   GET  /health                   -> health + dependency check
   GET  /                         -> API info
 """
@@ -25,6 +30,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import hashlib
+import html as html_module
 import json
 import os
 import re
@@ -40,11 +46,14 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 
+# =====================================================================
+# CONFIG
+# =====================================================================
 VISION_URL = os.getenv(
     "VISION_URL", "http://vision-solver.railway.internal:9002"
 )
 FLARESOLVERR_URL = os.getenv(
-    "FLARESOLVERR_URL", "http://flaresolverr.railway.internal:8191"
+    "FLARESOLVERR_URL", "http://127.0.0.1:8191"
 )
 FLARESOLVERR_ENABLED = os.getenv(
     "FLARESOLVERR_ENABLED", "1"
@@ -57,6 +66,9 @@ BROWSER_TIMEOUT = int(os.getenv("BROWSER_TIMEOUT", "120"))
 API_KEY = os.getenv("API_KEY", "")
 
 
+# =====================================================================
+# MODELS
+# =====================================================================
 class AltchaChallenge(BaseModel):
     algorithm: str = "SHA-256"
     challenge: str
@@ -109,6 +121,9 @@ class TaskResponse(BaseModel):
     updated_at: float
 
 
+# =====================================================================
+# TASK STORE
+# =====================================================================
 class TaskStore:
     def __init__(self):
         self._tasks: dict[str, dict[str, Any]] = {}
@@ -166,6 +181,9 @@ store = TaskStore()
 semaphore = asyncio.Semaphore(MAX_CONCURRENT)
 
 
+# =====================================================================
+# POW SOLVERS
+# =====================================================================
 def _solve_altcha(ch: AltchaChallenge) -> tuple[str, int]:
     max_n = min(ch.maxnumber, 5_000_000)
     for n in range(max_n):
@@ -194,6 +212,9 @@ def _solve_friendly(challenge_b64: str, difficulty: int,
     raise ValueError(f"no_solution_found_within_{max_nonce}_nonces")
 
 
+# =====================================================================
+# IMAGE SOLVER
+# =====================================================================
 async def _solve_image_via_vision(image_b64: str, hint: Optional[str]) -> str:
     async with httpx.AsyncClient(timeout=SOLVE_TIMEOUT) as c:
         try:
@@ -217,6 +238,9 @@ async def _solve_image_via_vision(image_b64: str, hint: Optional[str]) -> str:
         return text
 
 
+# =====================================================================
+# FLARESOLVERR
+# =====================================================================
 async def _check_flaresolverr() -> tuple[bool, str]:
     if not FLARESOLVERR_ENABLED:
         return False, "disabled_by_env"
@@ -234,12 +258,80 @@ async def _check_flaresolverr() -> tuple[bool, str]:
         return False, f"error_{type(e).__name__}"
 
 
+def _extract_turnstile_token(html: str) -> Optional[str]:
+    """
+    Extract Cloudflare Turnstile token from HTML.
+    Tries 7 regex patterns then falls back to generic token scan.
+    """
+    decoded = html_module.unescape(html)
+    patterns = [
+        # 1. Hidden input standard
+        r'<input[^>]*name=["\']cf-turnstile-response["\'][^>]*value=["\']([^"\']{20,})["\']',
+        # 2. Value before name
+        r'<input[^>]*value=["\']([^"\']{20,})["\'][^>]*name=["\']cf-turnstile-response["\']',
+        # 3. Textarea
+        r'<textarea[^>]*name=["\']cf-turnstile-response["\'][^>]*>([^<]{20,})</textarea>',
+        # 4. JSON embedded
+        r'["\']cf-turnstile-response["\']\s*[:=]\s*["\']([^"\']{20,})["\']',
+        # 5. turnstileToken variable
+        r'turnstileToken\s*[:=]\s*["\']([^"\']{20,})["\']',
+        # 6. Generic token variable name
+        r'(?:token|response|verify)\s*[:=]\s*["\'](0\.[A-Za-z0-9_\-\.]{80,})["\']',
+        # 7. Cloudflare clearance ray
+        r'cRay["\']?\s*[:=]\s*["\']([^"\']{20,})["\']',
+    ]
+    for pat in patterns:
+        m = re.search(pat, decoded)
+        if m:
+            token = m.group(1).strip()
+            if len(token) >= 30:
+                return token
+
+    # Fallback: scan all Turnstile-like tokens (0.xxx...)
+    candidates = re.findall(
+        r'["\'](0\.[A-Za-z0-9_\-]{80,})["\']', decoded
+    )
+    if candidates:
+        return max(candidates, key=len)
+    return None
+
+
+def _extract_recaptcha_token(html: str) -> Optional[str]:
+    """
+    Extract reCAPTCHA v2 token from HTML.
+    """
+    decoded = html_module.unescape(html)
+    patterns = [
+        r'<textarea[^>]*name=["\']g-recaptcha-response["\'][^>]*>([^<]{20,})</textarea>',
+        r'<textarea[^>]*id=["\']g-recaptcha-response["\'][^>]*>([^<]{20,})</textarea>',
+        r'["\']g-recaptcha-response["\']\s*[:=]\s*["\']([^"\']{20,})["\']',
+        r'<input[^>]*name=["\']g-recaptcha-response["\'][^>]*value=["\']([^"\']{20,})["\']',
+    ]
+    for pat in patterns:
+        m = re.search(pat, decoded)
+        if m:
+            token = m.group(1).strip()
+            if len(token) >= 30:
+                return token
+
+    # Fallback: scan all long base64-like tokens
+    candidates = re.findall(
+        r'["\']([A-Za-z0-9_\-]{100,})["\']', decoded
+    )
+    if candidates:
+        return max(candidates, key=len)
+    return None
+
+
 async def _solve_via_flaresolverr(
     sitekey: str,
     pageurl: str,
     kind: Literal["turnstile", "recaptcha"],
     proxy: Optional[str] = None,
 ) -> str:
+    """
+    Solve Turnstile or reCAPTCHA v2 via FlareSolverr.
+    """
     if not FLARESOLVERR_ENABLED:
         raise RuntimeError("flaresolverr_disabled")
 
@@ -283,43 +375,29 @@ async def _solve_via_flaresolverr(
             raise RuntimeError("flaresolverr_empty_response")
 
         if kind == "turnstile":
-            patterns = [
-                r'name="cf-turnstile-response"[^>]*value="([^"]{20,})"',
-                r'"cf-turnstile-response"\s*:\s*"([^"]{20,})"',
-                r'cf-turnstile-response[^>]{0,100}value="([^"]{20,})"',
-                r'window\.__cf_chl_opt\s*=\s*\{[^}]*?"cRay":\s*"([^"]{20,})"',
-            ]
-            for pat in patterns:
-                m = re.search(pat, html)
-                if m:
-                    token = m.group(1)
-                    if len(token) >= 30:
-                        return token
+            token = _extract_turnstile_token(html)
+            if token:
+                return token
             raise RuntimeError("turnstile_token_not_found_in_response")
 
         if kind == "recaptcha":
-            patterns = [
-                r'name="g-recaptcha-response"[^>]*>([^<]{20,})</textarea>',
-                r'"g-recaptcha-response"\s*:\s*"([^"]{20,})"',
-                r'id="g-recaptcha-response"[^>]*>([^<]{20,})</textarea>',
-            ]
-            for pat in patterns:
-                m = re.search(pat, html)
-                if m:
-                    token = m.group(1).strip()
-                    if len(token) >= 30:
-                        return token
+            token = _extract_recaptcha_token(html)
+            if token:
+                return token
             raise RuntimeError("recaptcha_token_not_found_in_response")
 
         raise RuntimeError(f"unsupported_kind_{kind}")
 
 
+# =====================================================================
+# LIFESPAN
+# =====================================================================
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await store.start()
     fs_ok, fs_detail = await _check_flaresolverr()
     print(
-        f"[app] started | version=3.0.0 | "
+        f"[app] started | version=3.1.0 | "
         f"vision={VISION_URL} | "
         f"flaresolverr={FLARESOLVERR_URL} ({fs_detail}) | "
         f"auth={'on' if API_KEY else 'off'}",
@@ -331,7 +409,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Fortress Captcha API",
-    version="3.0.0",
+    version="3.1.0",
     lifespan=lifespan,
 )
 app.add_middleware(
@@ -342,6 +420,9 @@ app.add_middleware(
 )
 
 
+# =====================================================================
+# AUTH
+# =====================================================================
 def require_api_key(request: Request):
     if not API_KEY:
         return
@@ -353,11 +434,14 @@ def require_api_key(request: Request):
         raise HTTPException(401, "invalid_api_key")
 
 
+# =====================================================================
+# INFO + HEALTH
+# =====================================================================
 @app.get("/")
 async def root():
     return {
         "service": "fortress-captcha",
-        "version": "3.0.0",
+        "version": "3.1.0",
         "auth_required": bool(API_KEY),
         "capabilities": {
             "altcha": True,
@@ -382,6 +466,7 @@ async def root():
                 "GET /v1/tasks/{id}/wait",
                 "DELETE /v1/tasks/{id}",
             ],
+            "debug": ["GET /v1/debug/flaresolverr?url=..."],
             "meta": ["GET /health"],
         },
     }
@@ -424,6 +509,9 @@ async def health():
     }
 
 
+# =====================================================================
+# SYNC SOLVERS
+# =====================================================================
 @app.post("/v1/solve/altcha", response_model=AltchaResponse)
 async def solve_altcha(req: AltchaRequest, _=Depends(require_api_key)):
     t0 = time.time()
@@ -455,6 +543,9 @@ async def solve_friendly(req: FriendlyRequest, _=Depends(require_api_key)):
     )
 
 
+# =====================================================================
+# BACKGROUND TASKS
+# =====================================================================
 async def _run_image_task(tid: str, image_b64: str, hint: Optional[str]):
     async with semaphore:
         await store.update(tid, status="processing")
@@ -495,6 +586,9 @@ async def _run_browser_task(
             )
 
 
+# =====================================================================
+# ASYNC ENDPOINTS
+# =====================================================================
 @app.post("/v1/solve/image", response_model=TaskResponse, status_code=202)
 async def submit_image(
     req: ImageRequest, bg: BackgroundTasks,
@@ -539,6 +633,9 @@ async def submit_recaptcha(
     return TaskResponse(**await store.get(tid))
 
 
+# =====================================================================
+# TASK MANAGEMENT
+# =====================================================================
 @app.get("/v1/tasks/{tid}", response_model=TaskResponse)
 async def get_task(tid: str, _=Depends(require_api_key)):
     t = await store.get(tid)
@@ -575,6 +672,77 @@ async def delete_task(tid: str, _=Depends(require_api_key)):
     return {"deleted": tid}
 
 
+# =====================================================================
+# DEBUG
+# =====================================================================
+@app.get("/v1/debug/flaresolverr")
+async def debug_flaresolverr(
+    url: str,
+    max_bytes: int = 50000,
+    _=Depends(require_api_key),
+):
+    """
+    Fetch URL via FlareSolverr and return raw HTML for troubleshooting.
+    Example: /v1/debug/flaresolverr?url=https://example.com
+    """
+    if not FLARESOLVERR_ENABLED:
+        raise HTTPException(503, "flaresolverr_disabled")
+
+    async with httpx.AsyncClient(timeout=BROWSER_TIMEOUT + 30) as c:
+        try:
+            r = await c.post(
+                f"{FLARESOLVERR_URL}/v1",
+                json={
+                    "cmd": "request.get",
+                    "url": url,
+                    "maxTimeout": BROWSER_TIMEOUT * 1000,
+                },
+            )
+        except Exception as e:
+            raise HTTPException(500, f"flaresolverr_failed: {e}")
+
+        if r.status_code != 200:
+            raise HTTPException(
+                500, f"http_{r.status_code}: {r.text[:200]}"
+            )
+
+        data = r.json()
+        html = data.get("solution", {}).get("response", "")
+        cookies = data.get("solution", {}).get("cookies", [])
+
+        # Keyword scan
+        keywords = [
+            "cf-turnstile", "turnstile",
+            "cf_chl", "challenge-platform",
+            "g-recaptcha", "recaptcha",
+            "cf-turnstile-response", "g-recaptcha-response",
+        ]
+        found = {}
+        for kw in keywords:
+            idx = html.lower().find(kw.lower())
+            if idx >= 0:
+                start = max(0, idx - 80)
+                end = min(len(html), idx + 200)
+                found[kw] = {
+                    "position": idx,
+                    "context": html[start:end],
+                }
+
+        return {
+            "url": url,
+            "flaresolverr_status": data.get("status", "unknown"),
+            "flaresolverr_message": data.get("message", ""),
+            "html_length": len(html),
+            "html_sample": html[:max_bytes],
+            "cookies_count": len(cookies),
+            "cookies_names": [c.get("name") for c in cookies],
+            "keywords_found": found,
+        }
+
+
+# =====================================================================
+# LEGACY /solve
+# =====================================================================
 _legacy_tasks: dict[str, dict[str, Any]] = {}
 _legacy_lock = asyncio.Lock()
 
@@ -600,6 +768,13 @@ def _legacy_response(tid: str, task: dict) -> dict:
 
 @app.post("/solve")
 async def legacy_solve(body: dict = Body(...)):
+    """
+    CapSkip-compatible endpoint for legacy scripts.
+
+    Poll mode:    {"taskId": "..."}
+    Submit mode:  {"type": "...", ...}
+    """
+    # Poll mode
     if "taskId" in body:
         tid = str(body["taskId"])
         async with _legacy_lock:
@@ -620,6 +795,7 @@ async def legacy_solve(body: dict = Body(...)):
         or body.get("data")
     )
 
+    # ALTCHA
     if ttype == "altcha" or (
         isinstance(challenge_raw, dict) and "salt" in challenge_raw
     ):
@@ -650,6 +826,7 @@ async def legacy_solve(body: dict = Body(...)):
             task = dict(_legacy_tasks[tid])
         return _legacy_response(tid, task)
 
+    # Friendly
     if ttype == "friendly" or (
         isinstance(challenge_raw, str)
         and ttype in ("", "friendly")
@@ -685,6 +862,7 @@ async def legacy_solve(body: dict = Body(...)):
             task = dict(_legacy_tasks[tid])
         return _legacy_response(tid, task)
 
+    # Image
     image_b64 = (
         body.get("image")
         or body.get("imageBase64")
@@ -706,6 +884,7 @@ async def legacy_solve(body: dict = Body(...)):
         )
         return {"taskId": tid, "status": "pending"}
 
+    # Turnstile
     if ttype == "turnstile":
         sitekey = (
             body.get("siteKey")
@@ -729,7 +908,7 @@ async def legacy_solve(body: dict = Body(...)):
             return {
                 "taskId": None, "status": "error",
                 "error": "flaresolverr_disabled",
-                "message": "Set FLARESOLVERR_ENABLED=1 dan deploy flaresolverr",
+                "message": "Set FLARESOLVERR_ENABLED=1",
             }
         tid = await store.create("turnstile")
         asyncio.create_task(
@@ -739,6 +918,7 @@ async def legacy_solve(body: dict = Body(...)):
         )
         return {"taskId": tid, "status": "pending"}
 
+    # reCAPTCHA v2
     if ttype in ("recaptcha", "userrecaptcha", "recaptcha_v2"):
         sitekey = (
             body.get("siteKey")
@@ -762,7 +942,7 @@ async def legacy_solve(body: dict = Body(...)):
             return {
                 "taskId": None, "status": "error",
                 "error": "flaresolverr_disabled",
-                "message": "Set FLARESOLVERR_ENABLED=1 dan deploy flaresolverr",
+                "message": "Set FLARESOLVERR_ENABLED=1",
             }
         tid = await store.create("recaptcha")
         asyncio.create_task(
@@ -772,6 +952,7 @@ async def legacy_solve(body: dict = Body(...)):
         )
         return {"taskId": tid, "status": "pending"}
 
+    # Unsupported
     if ttype in ("hcaptcha", "recaptcha_v3"):
         return {
             "taskId": None, "status": "error",
@@ -787,18 +968,26 @@ async def legacy_solve(body: dict = Body(...)):
     }
 
 
+# =====================================================================
+# TEST PAGE
+# =====================================================================
 @app.get("/test", include_in_schema=False)
 async def test_page():
     from fastapi.responses import HTMLResponse
     return HTMLResponse(content=(
-        "<!doctype html><html><head><title>Fortress v3</title></head>"
-        "<body><h1>Fortress Captcha v3.0</h1>"
+        "<!doctype html><html><head><title>Fortress v3.1</title></head>"
+        "<body><h1>Fortress Captcha v3.1</h1>"
         "<p>ALTCHA / Friendly / Image / Turnstile / reCAPTCHA</p>"
-        "<p><a href='/health'>/health</a> | <a href='/'>/</a></p>"
+        "<p><a href='/health'>/health</a> | "
+        "<a href='/'>/</a> | "
+        "<a href='/docs'>/docs</a></p>"
         "</body></html>"
     ))
 
 
+# =====================================================================
+# DIRECT RUN
+# =====================================================================
 if __name__ == "__main__":
     import uvicorn
     port = int(os.getenv("PORT", "8080"))
