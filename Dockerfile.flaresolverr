@@ -1,0 +1,17 @@
+# ═══════════════════════════════════════════════════════════════════════
+# FlareSolverr — Chromium-based challenge solver
+# Deploy sebagai Railway service terpisah (nama: "flaresolverr")
+# ═══════════════════════════════════════════════════════════════════════
+FROM ghcr.io/flaresolverr/flaresolverr:latest
+
+# Railway injects $PORT — FlareSolverr v3+ supports custom port
+ENV PORT=8191 \
+    LOG_LEVEL=info \
+    LOG_HTML=false \
+    TZ=UTC
+
+EXPOSE 8191
+
+# Healthcheck: FlareSolverr tidak punya /health — cek port
+HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=3 \
+  CMD wget -q --spider http://localhost:8191/ || exit 1
