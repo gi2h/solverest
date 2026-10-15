@@ -2,10 +2,10 @@
 set -e
 export PYTHONPATH="/solver:${PYTHONPATH:-}"
 export PYTHONUNBUFFERED=1
+export PLAYWRIGHT_BROWSERS_PATH="/ms-playwright"
 
 PORT="${PORT:-8080}"
-echo "[start] api-gateway booting on :$PORT"
-echo "[start] flaresolverr target: ${FLARESOLVERR_URL:-http://127.0.0.1:8191}"
+echo "[start] Fortress Captcha v4.0 (patchright) on :$PORT"
 
 exec uvicorn app:app \
     --host 0.0.0.0 \
