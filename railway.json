@@ -6,7 +6,7 @@
     "buildTimeout": 1800
   },
   "deploy": {
-    "startCommand": "/start.sh",
+    "startCommand": "/usr/bin/supervisord -c /solver/supervisord.conf",
     "healthcheckPath": "/health",
     "healthcheckTimeout": 600,
     "restartPolicyType": "ON_FAILURE",
