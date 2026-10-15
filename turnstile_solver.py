@@ -1,8 +1,7 @@
 """
-Turnstile + reCAPTCHA solver using Patchright with Xvfb (non-headless).
+Turnstile + reCAPTCHA solver using Patchright + Xvfb.
 
-Runs Chromium in a virtual display via pyvirtualdisplay so Cloudflare
-cannot detect the "headless" fingerprint.
+Debugging-focused: logs HTML sample + console errors when iframe not found.
 """
 from __future__ import annotations
 
@@ -26,7 +25,6 @@ USER_AGENT = (
 )
 
 
-# JavaScript injected BEFORE page load to hide automation
 STEALTH_JS = """
 Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
 Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
@@ -65,13 +63,11 @@ def _launch_args() -> list:
         "--disable-background-networking",
         "--disable-features=IsolateOrigins,site-per-process",
         "--window-size=1280,800",
-        "--window-position=0,0",
         "--start-maximized",
     ]
 
 
 def _start_xvfb():
-    """Start virtual display. Returns display object (must be kept alive)."""
     from pyvirtualdisplay import Display
     display = Display(visible=0, size=(1280, 800))
     display.start()
@@ -107,25 +103,61 @@ async def _read_token(page, input_name: str) -> Optional[str]:
         return None
 
 
-async def _list_iframes(page) -> list:
+async def _page_stats(page) -> dict:
+    """Collect statistics about current page."""
     try:
         return await page.evaluate("""
-            () => Array.from(document.querySelectorAll('iframe')).map(f => ({
-                src: f.src || '',
-                title: f.title || '',
-                id: f.id || '',
-                class: f.className || '',
-                visible: f.offsetWidth > 0 && f.offsetHeight > 0,
-                w: f.offsetWidth,
-                h: f.offsetHeight,
-            }))
+            () => {
+                const iframes = Array.from(document.querySelectorAll('iframe'));
+                const scripts = Array.from(document.querySelectorAll('script'));
+                const forms = Array.from(document.querySelectorAll('form'));
+                const inputs = Array.from(document.querySelectorAll('input'));
+                const title = document.title;
+                const bodyLen = document.body ? document.body.innerHTML.length : 0;
+                const htmlLen = document.documentElement.outerHTML.length;
+
+                // Detect Cloudflare challenge
+                const isCfChallenge = !!(
+                    document.querySelector('#cf-chl-widget') ||
+                    document.querySelector('.cf-challenge') ||
+                    document.querySelector('[id*="cf-chl"]') ||
+                    (document.body && document.body.innerHTML.includes('cf_chl_opt')) ||
+                    (document.title && document.title.toLowerCase().includes('just a moment'))
+                );
+
+                // Detect Turnstile div
+                const hasTurnstileDiv = !!document.querySelector('.cf-turnstile, [data-sitekey]');
+
+                return {
+                    title: title,
+                    url: window.location.href,
+                    iframeCount: iframes.length,
+                    iframeSrcs: iframes.map(f => f.src || '').slice(0, 5),
+                    scriptCount: scripts.length,
+                    scriptSrcs: scripts.map(s => s.src || '(inline)').slice(0, 10),
+                    formCount: forms.length,
+                    inputCount: inputs.length,
+                    inputNames: inputs.map(i => i.name || '').filter(Boolean).slice(0, 10),
+                    bodyLen: bodyLen,
+                    htmlLen: htmlLen,
+                    isCfChallenge: isCfChallenge,
+                    hasTurnstileDiv: hasTurnstileDiv,
+                };
+            }
         """)
-    except Exception:
-        return []
+    except Exception as e:
+        return {"error": str(e)[:200]}
+
+
+async def _html_sample(page, max_len: int = 3000) -> str:
+    try:
+        html = await page.content()
+        return html[:max_len]
+    except Exception as e:
+        return f"<error: {e}>"
 
 
 async def _find_turnstile_iframe(page):
-    """Try multiple selectors to find Turnstile iframe."""
     selectors = [
         'iframe[src*="challenges.cloudflare.com"]',
         'iframe[src*="turnstile"]',
@@ -153,58 +185,23 @@ async def _click_widget(page, iframe_el) -> bool:
         box = await iframe_el.bounding_box()
         if not box:
             return False
-
         log.info(
             "click: iframe at x=%.0f y=%.0f w=%.0f h=%.0f",
             box["x"], box["y"], box["width"], box["height"],
         )
-
-        # Turnstile checkbox: left ~30px, center vertical
         cx = box["x"] + 30
         cy = box["y"] + (box["height"] / 2)
-
-        # Human-like mouse approach
         await page.mouse.move(cx - 50, cy - 40, steps=8)
         await asyncio.sleep(0.3)
-        await page.mouse.move(cx - 20, cy - 10, steps=6)
-        await asyncio.sleep(0.2)
-        await page.mouse.move(cx, cy, steps=8)
+        await page.mouse.move(cx, cy, steps=12)
         await asyncio.sleep(0.2)
         await page.mouse.click(cx, cy)
         await asyncio.sleep(0.5)
-
         log.info("click: done at (%.0f, %.0f)", cx, cy)
         return True
     except Exception as e:
         log.info("click failed: %s", e)
         return False
-
-
-async def _dump_debug(page) -> dict:
-    """Collect debug info: screenshot + iframe list + URL."""
-    info = {
-        "url": page.url,
-        "title": "",
-        "iframe_count": 0,
-        "iframes": [],
-        "screenshot_b64": "",
-    }
-    try:
-        info["title"] = await page.title()
-    except Exception:
-        pass
-    try:
-        iframes = await _list_iframes(page)
-        info["iframes"] = iframes
-        info["iframe_count"] = len(iframes)
-    except Exception:
-        pass
-    try:
-        shot = await page.screenshot(full_page=False)
-        info["screenshot_b64"] = base64.b64encode(shot).decode()[:200000]
-    except Exception:
-        pass
-    return info
 
 
 async def solve_turnstile(
@@ -217,7 +214,6 @@ async def solve_turnstile(
     """
     Solve Cloudflare Turnstile widget.
     Returns: {"token": str, "debug": {...}}
-    Raises RuntimeError on failure.
     """
     try:
         from patchright.async_api import async_playwright
@@ -231,6 +227,9 @@ async def solve_turnstile(
         except Exception as e:
             log.warning("xvfb failed (%s), falling back to headless", e)
             headless = True
+
+    console_errors = []
+    page_errors = []
 
     try:
         log.info("turnstile: launching (headless=%s)", headless)
@@ -247,15 +246,23 @@ async def solve_turnstile(
             try:
                 context = await _new_context(browser)
                 await context.add_init_script(STEALTH_JS)
-
                 page = await context.new_page()
 
-                # Capture console messages for debug
-                console_logs = []
                 page.on(
                     "console",
-                    lambda msg: console_logs.append(
-                        f"{msg.type}: {msg.text[:200]}"
+                    lambda msg: console_errors.append(
+                        f"{msg.type}: {msg.text[:300]}"
+                    ) if msg.type in ("error", "warning") else None,
+                )
+                page.on(
+                    "pageerror",
+                    lambda err: page_errors.append(str(err)[:300]),
+                )
+                page.on(
+                    "requestfailed",
+                    lambda req: console_errors.append(
+                        f"REQ_FAILED: {req.url[:100]} - "
+                        f"{req.failure if req.failure else 'unknown'}"
                     ),
                 )
 
@@ -270,54 +277,112 @@ async def solve_turnstile(
                     raise RuntimeError(f"navigation_failed: {e}")
 
                 log.info("turnstile: page loaded url=%s", page.url)
-                await asyncio.sleep(2)  # let widget JS boot
 
-                # Check if token already present (auto-solve)
+                # Give JS time to boot + widgets to render
+                log.info("turnstile: waiting 5s for JS to boot")
+                await asyncio.sleep(5)
+
+                # Log stats after boot
+                stats = await _page_stats(page)
+                log.info(
+                    "turnstile: page stats after boot: "
+                    "title=%r url=%s iframes=%d scripts=%d forms=%d "
+                    "bodyLen=%d isCfChallenge=%s hasTurnstileDiv=%s",
+                    stats.get("title", ""),
+                    stats.get("url", ""),
+                    stats.get("iframeCount", 0),
+                    stats.get("scriptCount", 0),
+                    stats.get("formCount", 0),
+                    stats.get("bodyLen", 0),
+                    stats.get("isCfChallenge", False),
+                    stats.get("hasTurnstileDiv", False),
+                )
+                log.info(
+                    "turnstile: iframe srcs: %s",
+                    stats.get("iframeSrcs", []),
+                )
+                log.info(
+                    "turnstile: script srcs: %s",
+                    stats.get("scriptSrcs", []),
+                )
+                log.info(
+                    "turnstile: input names: %s",
+                    stats.get("inputNames", []),
+                )
+
+                # If Cloudflare challenge interstitial, wait longer
+                if stats.get("isCfChallenge"):
+                    log.info("turnstile: Cloudflare challenge detected, waiting up to 30s for redirect")
+                    cf_deadline = asyncio.get_event_loop().time() + 30
+                    while asyncio.get_event_loop().time() < cf_deadline:
+                        await asyncio.sleep(2)
+                        new_stats = await _page_stats(page)
+                        if not new_stats.get("isCfChallenge"):
+                            log.info("turnstile: challenge passed, url=%s", new_stats.get("url", ""))
+                            stats = new_stats
+                            break
+                    else:
+                        log.warning("turnstile: CF challenge not cleared after 30s")
+
+                # Check for token first
                 token = await _read_token(page, "cf-turnstile-response")
                 if token:
-                    log.info("token present immediately len=%d", len(token))
-                    return {"token": token, "debug": {"early": True}}
+                    log.info("turnstile: token present early len=%d", len(token))
+                    return {"token": token, "debug": {"early": True, **stats}}
 
-                # Wait for Turnstile iframe (multiple selectors)
-                log.info("waiting for turnstile iframe...")
+                # Find iframe
+                log.info("turnstile: waiting for iframe...")
                 deadline = asyncio.get_event_loop().time() + timeout
                 iframe_el = None
                 attempts = 0
-
                 while asyncio.get_event_loop().time() < deadline:
                     attempts += 1
                     iframe_el = await _find_turnstile_iframe(page)
                     if iframe_el:
                         break
 
-                    # Try token check every loop
                     token = await _read_token(page, "cf-turnstile-response")
                     if token:
-                        log.info("token found during iframe wait len=%d", len(token))
                         return {"token": token, "debug": {"attempts": attempts}}
 
-                    if attempts % 5 == 0:
-                        iframes = await _list_iframes(page)
+                    if attempts in (5, 15, 30):
+                        s = await _page_stats(page)
                         log.info(
-                            "attempt %d: url=%s iframes=%d",
-                            attempts, page.url, len(iframes),
+                            "turnstile attempt %d: url=%s iframes=%d "
+                            "isCf=%s hasTurnstileDiv=%s",
+                            attempts, s.get("url"), s.get("iframeCount"),
+                            s.get("isCfChallenge"), s.get("hasTurnstileDiv"),
                         )
                     await asyncio.sleep(1)
 
                 if not iframe_el:
-                    debug = await _dump_debug(page)
+                    # Dump HTML + console errors for diagnosis
+                    html_sample = await _html_sample(page, 4000)
+                    log.error("turnstile: FAILED - no iframe. HTML sample:")
+                    log.error("--- HTML START ---")
+                    log.error("%s", html_sample)
+                    log.error("--- HTML END ---")
+                    log.error(
+                        "console errors: %s",
+                        console_errors[-10:] if console_errors else "none",
+                    )
+                    log.error(
+                        "page errors: %s",
+                        page_errors[-5:] if page_errors else "none",
+                    )
                     raise RuntimeError(
                         f"turnstile_iframe_not_found "
-                        f"(url={page.url}, iframes={debug['iframe_count']})"
+                        f"(url={page.url}, "
+                        f"iframes={stats.get('iframeCount', 0)}, "
+                        f"cf_challenge={stats.get('isCfChallenge', False)})"
                     )
 
-                log.info("iframe found after %d attempts", attempts)
+                log.info("turnstile: iframe found after %d attempts", attempts)
 
-                # Try clicking checkbox
                 clicked = await _click_widget(page, iframe_el)
 
                 # Poll for token
-                log.info("waiting for token (timeout=%ds)", timeout)
+                log.info("turnstile: waiting for token (timeout=%ds)", timeout)
                 deadline = asyncio.get_event_loop().time() + timeout
                 poll = 0
                 while asyncio.get_event_loop().time() < deadline:
@@ -325,21 +390,18 @@ async def solve_turnstile(
                     token = await _read_token(page, "cf-turnstile-response")
                     if token:
                         log.info(
-                            "token acquired len=%d (polls=%d)", len(token), poll
+                            "turnstile: token acquired len=%d (polls=%d)",
+                            len(token), poll,
                         )
                         return {"token": token, "debug": {"polls": poll}}
 
                     if clicked and poll % 5 == 0:
-                        log.info("re-clicking checkbox (poll %d)", poll)
+                        log.info("turnstile: re-clicking (poll %d)", poll)
                         await _click_widget(page, iframe_el)
 
                     await asyncio.sleep(1)
 
-                debug = await _dump_debug(page)
-                raise RuntimeError(
-                    f"turnstile_token_timeout "
-                    f"(iframe_count={debug['iframe_count']})"
-                )
+                raise RuntimeError("turnstile_token_timeout")
 
             finally:
                 try:
@@ -393,17 +455,11 @@ async def solve_recaptcha(
                 await context.add_init_script(STEALTH_JS)
                 page = await context.new_page()
 
-                log.info("recaptcha: navigating to %s", pageurl)
-                try:
-                    await page.goto(
-                        pageurl, wait_until="domcontentloaded", timeout=30000
-                    )
-                except Exception as e:
-                    raise RuntimeError(f"navigation_failed: {e}")
+                await page.goto(
+                    pageurl, wait_until="domcontentloaded", timeout=30000
+                )
+                await asyncio.sleep(5)
 
-                await asyncio.sleep(2)
-
-                # Find recaptcha iframe
                 iframe_sel = (
                     'iframe[src*="google.com/recaptcha"], '
                     'iframe[title*="recaptcha"]'
@@ -467,7 +523,6 @@ async def get_cloudflare_cookie(
             headless = True
 
     try:
-        log.info("cf-cookie: launching (headless=%s)", headless)
         launch_opts = {
             "headless": headless,
             "args": _launch_args(),
@@ -483,14 +538,9 @@ async def get_cloudflare_cookie(
                 await context.add_init_script(STEALTH_JS)
                 page = await context.new_page()
 
-                log.info("cf-cookie: navigating to %s", url)
-                try:
-                    await page.goto(
-                        url, wait_until="domcontentloaded", timeout=30000
-                    )
-                except Exception as e:
-                    raise RuntimeError(f"navigation_failed: {e}")
-
+                await page.goto(
+                    url, wait_until="domcontentloaded", timeout=30000
+                )
                 await asyncio.sleep(3)
 
                 deadline = asyncio.get_event_loop().time() + timeout
@@ -498,7 +548,6 @@ async def get_cloudflare_cookie(
                     cookies = await context.cookies()
                     names = {c["name"] for c in cookies}
                     if "cf_clearance" in names:
-                        log.info("cf-cookie: got cf_clearance")
                         break
                     await asyncio.sleep(1)
 
