@@ -32,7 +32,7 @@ logging.basicConfig(
 log = logging.getLogger("solver")
 
 # ---------------------------------------------------------------- config
-HEADLESS = os.getenv("SOLVER_HEADLESS", "false").lower() == "true"
+HEADLESS = os.getenv("SOLVER_HEADLESS", "true").lower() == "true"
 NAV_TIMEOUT_MS = int(os.getenv("SOLVER_NAV_TIMEOUT_MS", "45000"))
 SOLVE_TIMEOUT_S = int(os.getenv("SOLVER_SOLVE_TIMEOUT_S", "120"))
 API_KEY = os.getenv("SOLVER_API_KEY", "")
