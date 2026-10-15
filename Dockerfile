@@ -1,39 +1,46 @@
-# ═══════════════════════════════════════════════════════════════════════
-# FORTRESS CAPTCHA - All-in-one (fix: non-root base image)
-# ═══════════════════════════════════════════════════════════════════════
-FROM ghcr.io/flaresolverr/flaresolverr:latest
-
-# FlareSolverr image runs as non-root user by default.
-# Switch to root to allow COPY + chmod + supervisord setup.
-USER root
+FROM python:3.12-slim
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PIP_NO_CACHE_DIR=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
     PYTHONPATH=/solver \
-    FLARESOLVERR_ENABLED=1 \
-    FLARESOLVERR_URL=http://127.0.0.1:8191
+    PLAYWRIGHT_BROWSERS_PATH=/ms-playwright \
+    DEBIAN_FRONTEND=noninteractive
 
 WORKDIR /solver
 
-# Python deps for api-gateway + supervisor (no apt-get, pip only)
+# System deps for Chromium (from Playwright recommended list)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        curl ca-certificates \
+        libnss3 libnspr4 \
+        libatk1.0-0 libatk-bridge2.0-0 \
+        libcups2 libdrm2 \
+        libxkbcommon0 libxcomposite1 \
+        libxdamage1 libxfixes3 libxrandr2 \
+        libgbm1 libpango-1.0-0 \
+        libcairo2 libasound2 \
+        libatspi2.0-0 \
+        libx11-xcb1 libxcb-dri3-0 \
+        fonts-liberation fonts-noto-color-emoji \
+        unzip \
+    && rm -rf /var/lib/apt/lists/*
+
+# Python deps + Patchright Chromium
 COPY requirements.txt /solver/requirements.txt
-RUN pip install --no-cache-dir supervisor==4.2.5 \
- && pip install --no-cache-dir -r /solver/requirements.txt
+RUN pip install --no-cache-dir --upgrade pip \
+ && pip install --no-cache-dir -r /solver/requirements.txt \
+ && patchright install chromium \
+ && chmod -R 777 /ms-playwright
 
 # App files
-COPY app.py /solver/app.py
+COPY app.py turnstile_solver.py /solver/
 COPY start.sh /solver/start.sh
-COPY supervisord.conf /solver/supervisord.conf
-
-# Ensure start.sh is executable (works because we're root now)
-RUN chmod 755 /solver/start.sh \
- && mkdir -p /var/log/supervisor /var/run
+RUN chmod +x /solver/start.sh
 
 EXPOSE 8080
 
-HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=5 \
+HEALTHCHECK --interval=30s --timeout=10s --start-period=45s --retries=5 \
   CMD curl -fsS "http://localhost:${PORT:-8080}/health" || exit 1
 
-CMD ["/usr/local/bin/supervisord", "-c", "/solver/supervisord.conf"]
+CMD ["/solver/start.sh"]
