@@ -35,7 +35,7 @@ RUN pip install --no-cache-dir --upgrade pip \
  && chmod -R 777 /ms-playwright
 
 # App files
-COPY app.py turnstile_solver.py /solver/
+COPY app.py turnstile_solver1.py /solver/
 COPY start.sh /solver/start.sh
 RUN chmod +x /solver/start.sh
 
