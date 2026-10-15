@@ -1,0 +1,16 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.env
+*.log
+models/*.h5
+models/*.onnx
+models/qwen-vision/
+wasm/target/
+services/wasm-service/solver.wasm
+.vscode/
+.idea/
+*.swp
+.DS_Store

@@ -1,0 +1,54 @@
+version: "3.9"
+
+x-common: &common
+  ENV: development
+  LOG_LEVEL: DEBUG
+  REDIS_URL: redis://redis:6379/0
+
+services:
+  redis:
+    image: redis:7.4-alpine
+    ports: ["6379:6379"]
+    networks: [fort-net]
+
+  api-gateway:
+    build: {context: ., dockerfile: services/api-gateway/Dockerfile}
+    environment: {<<: *common, API_PORT: 8080, API_KEY: dev-key}
+    ports: ["8080:8080"]
+    depends_on: [redis]
+    networks: [fort-net]
+
+  cloak-service:
+    build: {context: ., dockerfile: services/cloak-service/Dockerfile}
+    environment: {<<: *common, CLOAK_PORT: 9001}
+    networks: [fort-net]
+
+  vision-service:
+    build: {context: ., dockerfile: services/vision-service/Dockerfile}
+    environment: {<<: *common, VISION_PORT: 9002}
+    volumes: ["./models:/app/models:ro"]
+    networks: [fort-net]
+
+  ocr-service:
+    build: {context: ., dockerfile: services/ocr-service/Dockerfile}
+    environment: {<<: *common, OCR_PORT: 9003}
+    volumes: ["./models:/app/models:ro"]
+    networks: [fort-net]
+
+  altcha-service:
+    build: {context: ., dockerfile: services/altcha-service/Dockerfile}
+    environment: {<<: *common, ALTCHA_PORT: 9005}
+    networks: [fort-net]
+
+  friendly-service:
+    build: {context: ., dockerfile: services/friendly-service/Dockerfile}
+    environment: {<<: *common, FRIENDLY_PORT: 9006}
+    networks: [fort-net]
+
+  router-service:
+    build: {context: ., dockerfile: services/router-service/Dockerfile}
+    environment: {<<: *common, ROUTER_PORT: 9007}
+    networks: [fort-net]
+
+networks:
+  fort-net: {driver: bridge}
