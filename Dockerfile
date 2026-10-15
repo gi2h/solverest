@@ -10,7 +10,7 @@ ENV PYTHONUNBUFFERED=1 \
 
 WORKDIR /solver
 
-# System deps for Chromium (from Playwright recommended list)
+# Chromium system libs + Xvfb (virtual display) + utilities
 RUN apt-get update && apt-get install -y --no-install-recommends \
         curl ca-certificates \
         libnss3 libnspr4 \
@@ -23,6 +23,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         libatspi2.0-0 \
         libx11-xcb1 libxcb-dri3-0 \
         fonts-liberation fonts-noto-color-emoji \
+        xvfb x11-utils \
         unzip \
     && rm -rf /var/lib/apt/lists/*
 
