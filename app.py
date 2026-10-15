@@ -45,7 +45,7 @@ from fastapi import BackgroundTasks, Body, Depends, FastAPI, HTTPException, Requ
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
-from turnstile_solver import (
+from turnstile_solver1 import (
     get_cloudflare_cookie,
     solve_recaptcha,
     solve_turnstile,
