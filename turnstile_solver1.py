@@ -1,6 +1,6 @@
 """
 Turnstile + reCAPTCHA solver using Patchright + Xvfb.
-v2.2 - CSP bypass, network logging, manual render fallback.
+v2.4 - Accept 709-char tokens, DNS fallback, CSP bypass.
 """
 from __future__ import annotations
 
@@ -16,13 +16,11 @@ logging.basicConfig(
     format="[solver] %(message)s",
 )
 
-
 USER_AGENT = (
     "Mozilla/5.0 (X11; Linux x86_64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
     "Chrome/131.0.0.0 Safari/537.36"
 )
-
 
 STEALTH_JS = """
 Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
@@ -68,6 +66,7 @@ def _launch_args() -> list:
         "--disable-features=IsolateOrigins,site-per-process",
         "--window-size=1280,800",
         "--start-maximized",
+        "--disable-ipv6", # Fix ERR_NAME_NOT_RESOLVED on Railway/Docker
     ]
 
 
@@ -83,16 +82,25 @@ def _setup_page_listeners(page):
     """Log error browser, CSP, dan request yang gagal."""
     page.on("console", lambda msg: log.info(f"[console] {msg.type}: {msg.text}"))
     page.on("pageerror", lambda err: log.info(f"[pageerror] {err}"))
-    page.on("requestfailed", lambda req: log.info(f"[reqfail] {req.url[:80]} - {req.failure}"))
+    
+    def on_req_fail(req):
+        fail = req.failure
+        if fail == "net::ERR_NAME_NOT_RESOLVED":
+            log.warning(f"[reqfail] DNS Error (Blocked by ISP/Railway?): {req.url[:80]}")
+        else:
+            log.info(f"[reqfail] {req.url[:80]} - {fail}")
+            
+    page.on("requestfailed", on_req_fail)
 
 
 async def _bypass_csp(route):
-    """Intersepsi dan hapus CSP agar iframe Cloudflare bisa dimuat."""
+    """Intersepsi dan hapus CSP & X-Frame-Options agar iframe Cloudflare bisa dimuat."""
     try:
         response = await route.fetch()
         headers = response.headers
         headers.pop("content-security-policy", None)
         headers.pop("content-security-policy-report-only", None)
+        headers.pop("x-frame-options", None)
         await route.fulfill(response=response, headers=headers)
     except Exception:
         await route.continue_()
@@ -118,28 +126,29 @@ async def _safe_cleanup(page, context, browser):
     if page is not None:
         try:
             await asyncio.wait_for(page.close(run_before_unload=False), timeout=PAGE_CLOSE_TIMEOUT)
-        except Exception as e:
-            log.debug("page.close skipped: %s", e)
+        except Exception:
+            pass
 
     if context is not None:
         try:
             await asyncio.wait_for(context.close(), timeout=CONTEXT_CLOSE_TIMEOUT)
-        except Exception as e:
-            log.debug("context.close skipped: %s", e)
+        except Exception:
+            pass
 
     if browser is not None:
         try:
             await asyncio.wait_for(browser.close(), timeout=BROWSER_CLOSE_TIMEOUT)
-        except Exception as e:
-            log.debug("browser.close skipped: %s", e)
+        except Exception:
+            pass
 
 
 async def _read_token(page, input_name: str) -> Optional[str]:
+    """Kembalikan token jika panjangnya > 50 (Menerima token 709 karakter)."""
     try:
         return await page.evaluate(
             """(name) => {
                 const el = document.querySelector('[name="' + name + '"]');
-                return (el && el.value && el.value.length > 20) ? el.value : null;
+                return (el && el.value && el.value.length > 50) ? el.value : null;
             }""",
             input_name,
         )
@@ -153,10 +162,9 @@ async def _page_stats(page) -> dict:
             () => {
                 const iframes = Array.from(document.querySelectorAll('iframe'));
                 const title = document.title;
-                const url = window.location.href;
                 const bodyText = document.body ? document.body.innerText : '';
-
                 const titleLower = title.toLowerCase();
+                
                 const hasChallengeForm = !!document.querySelector('#challenge-form, .challenge-form, #challenge-stage');
                 const hasCfWrapper = !!document.querySelector('#cf-challenge-running, #cf-please-wait');
                 const bodySaysJustAMoment = bodyText.toLowerCase().includes('just a moment') || bodyText.toLowerCase().includes('verifying you are human');
@@ -167,17 +175,11 @@ async def _page_stats(page) -> dict:
                     (hasChallengeForm && hasCfWrapper)
                 );
 
-                const hasTurnstileDiv = !!document.querySelector('.cf-turnstile, [data-sitekey], [name="cf-turnstile-response"]');
                 const turnstileInput = document.querySelector('[name="cf-turnstile-response"]');
-
                 return {
                     title: title,
-                    url: url,
                     iframeCount: iframes.length,
-                    bodyLen: document.body ? document.body.innerHTML.length : 0,
                     isCfChallenge: isCfChallenge,
-                    hasTurnstileDiv: hasTurnstileDiv,
-                    hasTurnstileInput: !!turnstileInput,
                     inputValue: turnstileInput ? (turnstileInput.value || '').length : 0,
                 };
             }
@@ -203,12 +205,11 @@ async def _find_turnstile_iframe(page):
             if el:
                 box = await el.bounding_box()
                 if box and box["width"] > 10 and box["height"] > 10:
-                    log.info("found iframe via selector: %s", sel)
                     return el
         except Exception:
             continue
 
-    # Fallback: cek di dalam Shadow DOM (jika ada)
+    # Fallback: cek di dalam Shadow DOM
     try:
         el = await page.evaluate_handle("""
             () => {
@@ -239,11 +240,9 @@ async def _click_widget(page, iframe_el) -> bool:
     try:
         box = await iframe_el.bounding_box()
         if not box:
-            # Fallback: Klik area tengah div .cf-turnstile
             div = await page.query_selector('.cf-turnstile, [data-sitekey]')
             if div:
                 box = await div.bounding_box()
-        
         if not box:
             return False
 
@@ -255,7 +254,6 @@ async def _click_widget(page, iframe_el) -> bool:
         await asyncio.sleep(0.2)
         await page.mouse.click(cx, cy)
         await asyncio.sleep(0.5)
-        log.info("click: done at (%.0f, %.0f)", cx, cy)
         return True
     except Exception as e:
         log.info("click failed: %s", e)
@@ -283,7 +281,6 @@ async def solve_turnstile(
             headless = True
 
     try:
-        log.info("turnstile: launching (headless=%s)", headless)
         launch_opts = {
             "headless": headless,
             "args": _launch_args(),
@@ -298,7 +295,6 @@ async def solve_turnstile(
             page = None
             try:
                 context = await _new_context(browser)
-                # Daftarkan CSP bypass & logger
                 await context.route("**/*", _bypass_csp)
                 await context.add_init_script(STEALTH_JS)
                 page = await context.new_page()
@@ -310,34 +306,20 @@ async def solve_turnstile(
                 except Exception as e:
                     raise RuntimeError(f"navigation_failed: {e}")
 
-                log.info("turnstile: page loaded url=%s", page.url)
                 await asyncio.sleep(3)
 
                 stats = await _page_stats(page)
                 log.info(
-                    "turnstile: stats title=%r iframes=%d cf=%s turnstileDiv=%s",
+                    "turnstile: stats title=%r iframes=%d cf=%s",
                     stats.get("title", "")[:60],
                     stats.get("iframeCount", 0),
                     stats.get("isCfChallenge", False),
-                    stats.get("hasTurnstileDiv", False),
                 )
 
                 token = await _read_token(page, "cf-turnstile-response")
                 if token:
-                    log.info("turnstile: token present early len=%d", len(token))
+                    log.info("turnstile: valid token present early len=%d", len(token))
                     return {"token": token, "debug": {"early": True}}
-
-                if stats.get("isCfChallenge"):
-                    log.info("turnstile: real CF challenge detected, waiting up to 20s")
-                    cf_deadline = asyncio.get_event_loop().time() + 20
-                    while asyncio.get_event_loop().time() < cf_deadline:
-                        await asyncio.sleep(2)
-                        new_stats = await _page_stats(page)
-                        if not new_stats.get("isCfChallenge"):
-                            break
-                        token = await _read_token(page, "cf-turnstile-response")
-                        if token:
-                            return {"token": token, "debug": {"cf_pass": True}}
 
                 log.info("turnstile: waiting for token (timeout=%ds)", timeout)
                 deadline = asyncio.get_event_loop().time() + timeout
@@ -352,7 +334,7 @@ async def solve_turnstile(
 
                     token = await _read_token(page, "cf-turnstile-response")
                     if token:
-                        log.info("turnstile: token acquired len=%d at attempt %d", len(token), attempts)
+                        log.info("turnstile: valid token acquired len=%d at attempt %d", len(token), attempts)
                         return {"token": token, "debug": {"attempts": attempts}}
 
                     if not iframe_el:
@@ -360,7 +342,6 @@ async def solve_turnstile(
                         if iframe_el and not clicked:
                             clicked = await _click_widget(page, iframe_el)
 
-                    # Fallback: Paksa render script Turnstile jika iframe=0 setelah 10 detik
                     if not iframe_el and not render_attempted and attempts >= 10:
                         render_attempted = True
                         log.info("turnstile: no iframe detected, forcing manual render...")
@@ -382,15 +363,16 @@ async def solve_turnstile(
                         last_log = attempts
                         s = await _page_stats(page)
                         log.info(
-                            "turnstile attempt %d: iframes=%d cf=%s input_len=%d",
-                            attempts, s.get("iframeCount", 0), s.get("isCfChallenge", False), s.get("inputValue", 0),
+                            "turnstile attempt %d: iframes=%d input_len=%d",
+                            attempts, s.get("iframeCount", 0), s.get("inputValue", 0),
                         )
 
                     await asyncio.sleep(1)
 
                 stats = await _page_stats(page)
                 raise RuntimeError(
-                    f"turnstile_token_timeout (url={page.url}, iframes={stats.get('iframeCount', 0)}, cf={stats.get('isCfChallenge', False)})"
+                    f"turnstile_token_timeout (iframes={stats.get('iframeCount', 0)}, "
+                    f"input_len={stats.get('inputValue', 0)})"
                 )
 
             finally:
@@ -425,7 +407,6 @@ async def solve_recaptcha(
             headless = True
 
     try:
-        log.info("recaptcha: launching (headless=%s)", headless)
         launch_opts = {
             "headless": headless,
             "args": _launch_args(),
