@@ -1,6 +1,6 @@
 """
 Turnstile + reCAPTCHA solver using Patchright + Xvfb.
-v2.1 - Robust detection + tolerant wait + bulletproof browser cleanup.
+v2.2 - CSP bypass, network logging, manual render fallback.
 """
 from __future__ import annotations
 
@@ -50,8 +50,7 @@ WebGLRenderingContext.prototype.getParameter = function(p) {
 };
 """
 
-
-# === CLEANUP CONFIG (baru) ===
+# === CLEANUP CONFIG ===
 PAGE_CLOSE_TIMEOUT = float(os.getenv("PAGE_CLOSE_TIMEOUT", "5"))
 CONTEXT_CLOSE_TIMEOUT = float(os.getenv("CONTEXT_CLOSE_TIMEOUT", "5"))
 BROWSER_CLOSE_TIMEOUT = float(os.getenv("BROWSER_CLOSE_TIMEOUT", "10"))
@@ -80,6 +79,25 @@ def _start_xvfb():
     return display
 
 
+def _setup_page_listeners(page):
+    """Log error browser, CSP, dan request yang gagal."""
+    page.on("console", lambda msg: log.info(f"[console] {msg.type}: {msg.text}"))
+    page.on("pageerror", lambda err: log.info(f"[pageerror] {err}"))
+    page.on("requestfailed", lambda req: log.info(f"[reqfail] {req.url[:80]} - {req.failure}"))
+
+
+async def _bypass_csp(route):
+    """Intersepsi dan hapus CSP agar iframe Cloudflare bisa dimuat."""
+    try:
+        response = await route.fetch()
+        headers = response.headers
+        headers.pop("content-security-policy", None)
+        headers.pop("content-security-policy-report-only", None)
+        await route.fulfill(response=response, headers=headers)
+    except Exception:
+        await route.continue_()
+
+
 async def _new_context(browser):
     return await browser.new_context(
         viewport={"width": 1280, "height": 800},
@@ -96,38 +114,22 @@ async def _new_context(browser):
 
 
 async def _safe_cleanup(page, context, browser):
-    """
-    Hancurkan resource browser dengan urutan page -> context -> browser.
-    Setiap langkah punya timeout agar tidak menggantung selamanya.
-    Idempotent & best-effort: error ditelan, tidak mengganggu hasil task.
-    """
-    # 1. Page
+    """Tutup page -> context -> browser berurutan dengan timeout."""
     if page is not None:
         try:
-            await asyncio.wait_for(
-                page.close(run_before_unload=False),
-                timeout=PAGE_CLOSE_TIMEOUT,
-            )
+            await asyncio.wait_for(page.close(run_before_unload=False), timeout=PAGE_CLOSE_TIMEOUT)
         except Exception as e:
             log.debug("page.close skipped: %s", e)
 
-    # 2. Context (hapus cookies/localStorage/IndexedDB)
     if context is not None:
         try:
-            await asyncio.wait_for(
-                context.close(),
-                timeout=CONTEXT_CLOSE_TIMEOUT,
-            )
+            await asyncio.wait_for(context.close(), timeout=CONTEXT_CLOSE_TIMEOUT)
         except Exception as e:
             log.debug("context.close skipped: %s", e)
 
-    # 3. Browser (kill process)
     if browser is not None:
         try:
-            await asyncio.wait_for(
-                browser.close(),
-                timeout=BROWSER_CLOSE_TIMEOUT,
-            )
+            await asyncio.wait_for(browser.close(), timeout=BROWSER_CLOSE_TIMEOUT)
         except Exception as e:
             log.debug("browser.close skipped: %s", e)
 
@@ -146,10 +148,6 @@ async def _read_token(page, input_name: str) -> Optional[str]:
 
 
 async def _page_stats(page) -> dict:
-    """
-    Collect statistics. CF challenge detection is STRICT now -
-    only flags actual interstitial, not widget config.
-    """
     try:
         return await page.evaluate("""
             () => {
@@ -159,15 +157,9 @@ async def _page_stats(page) -> dict:
                 const bodyText = document.body ? document.body.innerText : '';
 
                 const titleLower = title.toLowerCase();
-                const hasChallengeForm = !!document.querySelector(
-                    '#challenge-form, .challenge-form, #challenge-stage'
-                );
-                const hasCfWrapper = !!document.querySelector(
-                    '#cf-challenge-running, #cf-please-wait'
-                );
-                const bodySaysJustAMoment =
-                    bodyText.toLowerCase().includes('just a moment') ||
-                    bodyText.toLowerCase().includes('verifying you are human');
+                const hasChallengeForm = !!document.querySelector('#challenge-form, .challenge-form, #challenge-stage');
+                const hasCfWrapper = !!document.querySelector('#cf-challenge-running, #cf-please-wait');
+                const bodySaysJustAMoment = bodyText.toLowerCase().includes('just a moment') || bodyText.toLowerCase().includes('verifying you are human');
 
                 const isCfChallenge = (
                     titleLower.includes('just a moment') ||
@@ -175,18 +167,13 @@ async def _page_stats(page) -> dict:
                     (hasChallengeForm && hasCfWrapper)
                 );
 
-                const hasTurnstileDiv = !!document.querySelector(
-                    '.cf-turnstile, [data-sitekey], [name="cf-turnstile-response"]'
-                );
-                const turnstileInput = document.querySelector(
-                    '[name="cf-turnstile-response"]'
-                );
+                const hasTurnstileDiv = !!document.querySelector('.cf-turnstile, [data-sitekey], [name="cf-turnstile-response"]');
+                const turnstileInput = document.querySelector('[name="cf-turnstile-response"]');
 
                 return {
                     title: title,
                     url: url,
                     iframeCount: iframes.length,
-                    iframeSrcs: iframes.map(f => (f.src || '').slice(0, 150)).slice(0, 5),
                     bodyLen: document.body ? document.body.innerHTML.length : 0,
                     isCfChallenge: isCfChallenge,
                     hasTurnstileDiv: hasTurnstileDiv,
@@ -200,6 +187,7 @@ async def _page_stats(page) -> dict:
 
 
 async def _find_turnstile_iframe(page):
+    """Cari iframe via selector, termasuk yang ada di dalam Shadow DOM."""
     selectors = [
         'iframe[src*="challenges.cloudflare.com"]',
         'iframe[src*="turnstile"]',
@@ -219,6 +207,31 @@ async def _find_turnstile_iframe(page):
                     return el
         except Exception:
             continue
+
+    # Fallback: cek di dalam Shadow DOM (jika ada)
+    try:
+        el = await page.evaluate_handle("""
+            () => {
+                const findInShadow = (root) => {
+                    const iframe = root.querySelector('iframe[src*="challenges.cloudflare.com"]');
+                    if (iframe) return iframe;
+                    const children = root.querySelectorAll('*');
+                    for (let child of children) {
+                        if (child.shadowRoot) {
+                            const found = findInShadow(child.shadowRoot);
+                            if (found) return found;
+                        }
+                    }
+                    return null;
+                };
+                return findInShadow(document);
+            }
+        """)
+        if el:
+            return await el.as_element()
+    except Exception:
+        pass
+
     return None
 
 
@@ -226,7 +239,14 @@ async def _click_widget(page, iframe_el) -> bool:
     try:
         box = await iframe_el.bounding_box()
         if not box:
+            # Fallback: Klik area tengah div .cf-turnstile
+            div = await page.query_selector('.cf-turnstile, [data-sitekey]')
+            if div:
+                box = await div.bounding_box()
+        
+        if not box:
             return False
+
         cx = box["x"] + 30
         cy = box["y"] + (box["height"] / 2)
         await page.mouse.move(cx - 50, cy - 40, steps=8)
@@ -249,12 +269,6 @@ async def solve_turnstile(
     proxy: Optional[str] = None,
     headless: bool = False,
 ) -> dict:
-    """
-    Solve Cloudflare Turnstile widget.
-
-    Tolerant wait: continues polling for token until timeout
-    even if iframe is not yet present.
-    """
     try:
         from patchright.async_api import async_playwright
     except ImportError as e:
@@ -284,22 +298,19 @@ async def solve_turnstile(
             page = None
             try:
                 context = await _new_context(browser)
+                # Daftarkan CSP bypass & logger
+                await context.route("**/*", _bypass_csp)
                 await context.add_init_script(STEALTH_JS)
                 page = await context.new_page()
+                _setup_page_listeners(page)
 
                 log.info("turnstile: navigating to %s", pageurl)
                 try:
-                    await page.goto(
-                        pageurl,
-                        wait_until="domcontentloaded",
-                        timeout=30000,
-                    )
+                    await page.goto(pageurl, wait_until="domcontentloaded", timeout=30000)
                 except Exception as e:
                     raise RuntimeError(f"navigation_failed: {e}")
 
                 log.info("turnstile: page loaded url=%s", page.url)
-
-                # Give JS time to boot
                 await asyncio.sleep(3)
 
                 stats = await _page_stats(page)
@@ -311,13 +322,11 @@ async def solve_turnstile(
                     stats.get("hasTurnstileDiv", False),
                 )
 
-                # Check early token (auto-solve in <3s)
                 token = await _read_token(page, "cf-turnstile-response")
                 if token:
                     log.info("turnstile: token present early len=%d", len(token))
                     return {"token": token, "debug": {"early": True}}
 
-                # If actual CF interstitial (rare), wait up to 20s
                 if stats.get("isCfChallenge"):
                     log.info("turnstile: real CF challenge detected, waiting up to 20s")
                     cf_deadline = asyncio.get_event_loop().time() + 20
@@ -325,60 +334,66 @@ async def solve_turnstile(
                         await asyncio.sleep(2)
                         new_stats = await _page_stats(page)
                         if not new_stats.get("isCfChallenge"):
-                            log.info("turnstile: CF challenge cleared")
                             break
                         token = await _read_token(page, "cf-turnstile-response")
                         if token:
                             return {"token": token, "debug": {"cf_pass": True}}
 
-                # Tolerant wait loop: poll for token until timeout.
                 log.info("turnstile: waiting for token (timeout=%ds)", timeout)
                 deadline = asyncio.get_event_loop().time() + timeout
                 iframe_el = None
                 clicked = False
                 attempts = 0
                 last_log = 0
+                render_attempted = False
 
                 while asyncio.get_event_loop().time() < deadline:
                     attempts += 1
 
-                    # Priority 1: check token
                     token = await _read_token(page, "cf-turnstile-response")
                     if token:
-                        log.info(
-                            "turnstile: token acquired len=%d at attempt %d",
-                            len(token), attempts,
-                        )
+                        log.info("turnstile: token acquired len=%d at attempt %d", len(token), attempts)
                         return {"token": token, "debug": {"attempts": attempts}}
 
-                    # Priority 2: try to find iframe and click
                     if not iframe_el:
                         iframe_el = await _find_turnstile_iframe(page)
                         if iframe_el and not clicked:
                             clicked = await _click_widget(page, iframe_el)
+
+                    # Fallback: Paksa render script Turnstile jika iframe=0 setelah 10 detik
+                    if not iframe_el and not render_attempted and attempts >= 10:
+                        render_attempted = True
+                        log.info("turnstile: no iframe detected, forcing manual render...")
+                        await page.evaluate("""
+                            () => {
+                                if (window.turnstile && window.turnstile.render) {
+                                    const div = document.querySelector('.cf-turnstile');
+                                    if (div && div.innerHTML.trim() === '') {
+                                        try {
+                                            const key = div.getAttribute('data-sitekey');
+                                            if (key) window.turnstile.render(div, { sitekey: key });
+                                        } catch(e) {}
+                                    }
+                                }
+                            }
+                        """)
 
                     if attempts - last_log >= 10:
                         last_log = attempts
                         s = await _page_stats(page)
                         log.info(
                             "turnstile attempt %d: iframes=%d cf=%s input_len=%d",
-                            attempts,
-                            s.get("iframeCount", 0),
-                            s.get("isCfChallenge", False),
-                            s.get("inputValue", 0),
+                            attempts, s.get("iframeCount", 0), s.get("isCfChallenge", False), s.get("inputValue", 0),
                         )
 
                     await asyncio.sleep(1)
 
                 stats = await _page_stats(page)
                 raise RuntimeError(
-                    f"turnstile_token_timeout "
-                    f"(url={page.url}, iframes={stats.get('iframeCount', 0)}, "
-                    f"cf={stats.get('isCfChallenge', False)})"
+                    f"turnstile_token_timeout (url={page.url}, iframes={stats.get('iframeCount', 0)}, cf={stats.get('isCfChallenge', False)})"
                 )
 
             finally:
-                # CHANGED: explicit page -> context -> browser cleanup
                 await _safe_cleanup(page, context, browser)
 
     finally:
@@ -396,7 +411,6 @@ async def solve_recaptcha(
     proxy: Optional[str] = None,
     headless: bool = False,
 ) -> dict:
-    """Solve reCAPTCHA v2 widget."""
     try:
         from patchright.async_api import async_playwright
     except ImportError as e:
@@ -426,18 +440,15 @@ async def solve_recaptcha(
             page = None
             try:
                 context = await _new_context(browser)
+                await context.route("**/*", _bypass_csp)
                 await context.add_init_script(STEALTH_JS)
                 page = await context.new_page()
+                _setup_page_listeners(page)
 
-                await page.goto(
-                    pageurl, wait_until="domcontentloaded", timeout=30000
-                )
+                await page.goto(pageurl, wait_until="domcontentloaded", timeout=30000)
                 await asyncio.sleep(3)
 
-                iframe_sel = (
-                    'iframe[src*="google.com/recaptcha"], '
-                    'iframe[title*="recaptcha"]'
-                )
+                iframe_sel = 'iframe[src*="google.com/recaptcha"], iframe[title*="recaptcha"]'
                 deadline = asyncio.get_event_loop().time() + timeout
                 clicked = False
                 iframe_el = None
@@ -457,7 +468,6 @@ async def solve_recaptcha(
                 raise RuntimeError("recaptcha_token_timeout")
 
             finally:
-                # CHANGED: explicit page -> context -> browser cleanup
                 await _safe_cleanup(page, context, browser)
     finally:
         if display:
@@ -473,7 +483,6 @@ async def get_cloudflare_cookie(
     proxy: Optional[str] = None,
     headless: bool = False,
 ) -> dict:
-    """Fetch URL and return cookies + user-agent."""
     try:
         from patchright.async_api import async_playwright
     except ImportError as e:
@@ -502,12 +511,12 @@ async def get_cloudflare_cookie(
             page = None
             try:
                 context = await _new_context(browser)
+                await context.route("**/*", _bypass_csp)
                 await context.add_init_script(STEALTH_JS)
                 page = await context.new_page()
+                _setup_page_listeners(page)
 
-                await page.goto(
-                    url, wait_until="domcontentloaded", timeout=30000
-                )
+                await page.goto(url, wait_until="domcontentloaded", timeout=30000)
                 await asyncio.sleep(3)
 
                 deadline = asyncio.get_event_loop().time() + timeout
@@ -530,7 +539,6 @@ async def get_cloudflare_cookie(
                 }
 
             finally:
-                # CHANGED: explicit page -> context -> browser cleanup
                 await _safe_cleanup(page, context, browser)
     finally:
         if display:
