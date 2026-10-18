@@ -1,37 +1,5 @@
 """
 Fortress Captcha API v4.2 - Patchright + Xvfb solver.
-
-Changelog v4.2:
-  - MAX_QUEUE_SIZE = 6 (queue penuh → "slot habis, ulangi lagi nanti")
-  - Atomic create_if_slot() untuk hindari race condition
-  - Cleanup agresif: task done/failed dihapus setelah DONE_TASK_TTL
-  - Cleanup _legacy_tasks (ALTCHA/Friendly) yang sebelumnya bocor
-  - /health menampilkan status queue
-
-Changelog v4.1:
-  - Non-headless Chromium via Xvfb (bypass headless detection)
-  - Stealth JS init script injected before page load
-  - New /v1/debug/turnstile endpoint (screenshot + iframe list)
-  - Better error messages with debug info
-
-Changelog v4.0:
-  - Patchright-based solver (real browser interaksi)
-  - Drop FlareSolverr entirely
-
-Endpoints:
-  POST /solve                    -> legacy CapSkip-compatible
-  POST /v1/solve/altcha          -> sync ALTCHA PoW
-  POST /v1/solve/friendly        -> sync Friendly Captcha PoW
-  POST /v1/solve/image           -> async image (vision-solver)
-  POST /v1/solve/turnstile       -> async Turnstile (Patchright)
-  POST /v1/solve/recaptcha       -> async reCAPTCHA v2 (Patchright)
-  GET  /v1/solve/cloudflare      -> cookies + UA via Patchright
-  POST /v1/debug/turnstile       -> debug: screenshot + iframe list
-  GET  /v1/tasks/{id}            -> task status
-  GET  /v1/tasks/{id}/wait       -> long-poll
-  DELETE /v1/tasks/{id}          -> delete task
-  GET  /health                   -> health check
-  GET  /                         -> API info
 """
 from __future__ import annotations
 
@@ -58,32 +26,24 @@ from turnstile_solver1 import (
     solve_turnstile,
 )
 
-
 logging.basicConfig(
     level=logging.INFO,
     format="[app] %(asctime)s %(levelname)s %(message)s",
 )
 
-
 # =====================================================================
 # CONFIG
 # =====================================================================
-VISION_URL = os.getenv(
-    "VISION_URL", "http://vision-solver.railway.internal:9002"
-)
+VISION_URL = os.getenv("VISION_URL", "http://vision-solver.railway.internal:9002")
 TASK_TTL = int(os.getenv("TASK_TTL_SECONDS", "3600"))
-# Task done/failed dibersihkan lebih cepat (browser sudah ditutup solver,
-# data hasil tidak berguna lagi setelah client ambil).
 DONE_TASK_TTL = int(os.getenv("DONE_TASK_TTL_SECONDS", "600"))
 MAX_CONCURRENT = int(os.getenv("MAX_CONCURRENT_SOLVES", "2"))
-# Batas queue pending. Jika penuh → "slot habis, ulangi lagi nanti"
 MAX_QUEUE_SIZE = int(os.getenv("MAX_QUEUE_SIZE", "6"))
 SOLVE_TIMEOUT = int(os.getenv("SOLVE_TIMEOUT", "180"))
 BROWSER_TIMEOUT = int(os.getenv("BROWSER_TIMEOUT", "90"))
 API_KEY = os.getenv("API_KEY", "")
 
 QUEUE_FULL_MSG = "slot habis, ulangi lagi nanti"
-
 
 # =====================================================================
 # MODELS
@@ -94,40 +54,33 @@ class AltchaChallenge(BaseModel):
     salt: str
     maxnumber: int = 1_000_000
 
-
 class AltchaRequest(BaseModel):
     challenge: AltchaChallenge
-
 
 class AltchaResponse(BaseModel):
     solution: str
     iterations: int
     elapsed_ms: int
 
-
 class FriendlyRequest(BaseModel):
     challenge: str
     difficulty: int = 16
     max_nonce: int = 10_000_000
-
 
 class FriendlyResponse(BaseModel):
     solution: str
     nonce: int
     elapsed_ms: int
 
-
 class ImageRequest(BaseModel):
     image_base64: str
     hint: Optional[str] = None
-
 
 class BrowserRequest(BaseModel):
     sitekey: str
     pageurl: str
     action: Optional[str] = None
     proxy: Optional[str] = None
-
 
 class TaskResponse(BaseModel):
     id: str
@@ -139,14 +92,11 @@ class TaskResponse(BaseModel):
     created_at: float
     updated_at: float
 
-
 # =====================================================================
-# LEGACY STORE (ALTCHA/Friendly sync) - dideklarasikan lebih dulu
-# karena dipakai oleh TaskStore._cleanup_loop()
+# LEGACY STORE
 # =====================================================================
 _legacy_tasks: dict[str, dict[str, Any]] = {}
 _legacy_lock = asyncio.Lock()
-
 
 # =====================================================================
 # TASK STORE
@@ -179,16 +129,8 @@ class TaskStore:
         return tid
 
     async def create_if_slot(self, task_type: str) -> Optional[str]:
-        """Atomic check-and-create.
-
-        Return task id jika queue masih ada slot, None jika queue penuh
-        (>= MAX_QUEUE_SIZE pending). Mencegah race condition antara cek
-        dan create saat banyak request bersamaan.
-        """
         async with self._lock:
-            pending = sum(
-                1 for t in self._tasks.values() if t["status"] == "pending"
-            )
+            pending = sum(1 for t in self._tasks.values() if t["status"] == "pending")
             if pending >= MAX_QUEUE_SIZE:
                 return None
             tid = str(uuid.uuid4())
@@ -214,17 +156,12 @@ class TaskStore:
             return self._tasks.pop(tid, None) is not None
 
     async def _cleanup_loop(self):
-        # Dijalankan tiap 30 detik. Dua cutoff:
-        #  - pending/processing : TASK_TTL (default 3600s)
-        #  - done/failed        : DONE_TASK_TTL (default 600s)
-        # Browser cleanup sudah ditangani turnstile_solver1._safe_cleanup().
         while True:
             await asyncio.sleep(30)
             now = time.time()
             pending_cutoff = now - TASK_TTL
             done_cutoff = now - DONE_TASK_TTL
 
-            # 1. Cleanup main task store
             async with self._lock:
                 to_delete = []
                 for k, v in self._tasks.items():
@@ -237,8 +174,6 @@ class TaskStore:
                 for k in to_delete:
                     self._tasks.pop(k, None)
 
-            # 2. Cleanup legacy ALTCHA/Friendly tasks
-            #    (sebelumnya bocor selamanya di memori)
             if _legacy_tasks:
                 async with _legacy_lock:
                     legacy_delete = []
@@ -257,7 +192,6 @@ class TaskStore:
 store = TaskStore()
 semaphore = asyncio.Semaphore(MAX_CONCURRENT)
 
-
 # =====================================================================
 # POW SOLVERS
 # =====================================================================
@@ -265,20 +199,11 @@ def _solve_altcha(ch: AltchaChallenge) -> tuple[str, int]:
     max_n = min(ch.maxnumber, 5_000_000)
     for n in range(max_n):
         if hashlib.sha256(f"{ch.salt}{n}".encode()).hexdigest() == ch.challenge:
-            solution = {
-                "algorithm": ch.algorithm,
-                "challenge": ch.challenge,
-                "number": n,
-                "salt": ch.salt,
-            }
-            return base64.b64encode(
-                json.dumps(solution).encode()
-            ).decode(), n
+            solution = {"algorithm": ch.algorithm, "challenge": ch.challenge, "number": n, "salt": ch.salt}
+            return base64.b64encode(json.dumps(solution).encode()).decode(), n
     raise ValueError(f"no_solution_found_within_{max_n}_iterations")
 
-
-def _solve_friendly(challenge_b64: str, difficulty: int,
-                    max_nonce: int) -> tuple[str, int]:
+def _solve_friendly(challenge_b64: str, difficulty: int, max_nonce: int) -> tuple[str, int]:
     buf = base64.b64decode(challenge_b64)
     threshold = 1 << (32 - difficulty)
     for nonce in range(max_nonce):
@@ -288,17 +213,13 @@ def _solve_friendly(challenge_b64: str, difficulty: int,
             return base64.b64encode(b).decode(), nonce
     raise ValueError(f"no_solution_found_within_{max_nonce}_nonces")
 
-
 # =====================================================================
 # IMAGE SOLVER
 # =====================================================================
 async def _solve_image_via_vision(image_b64: str, hint: Optional[str]) -> str:
     async with httpx.AsyncClient(timeout=SOLVE_TIMEOUT) as c:
         try:
-            r = await c.post(
-                f"{VISION_URL}/solve-text",
-                json={"image": image_b64, "hint": hint or ""},
-            )
+            r = await c.post(f"{VISION_URL}/solve-text", json={"image": image_b64, "hint": hint or ""})
         except httpx.ConnectError as e:
             raise RuntimeError(f"vision_unreachable: {e}")
         except httpx.TimeoutException:
@@ -312,69 +233,35 @@ async def _solve_image_via_vision(image_b64: str, hint: Optional[str]) -> str:
             raise RuntimeError("vision_returned_empty")
         return text
 
-
 # =====================================================================
 # BROWSER SOLVER WRAPPER
 # =====================================================================
 def _run_async_in_thread(coro):
-    """Run an async coroutine in a new event loop (from a worker thread)."""
     loop = asyncio.new_event_loop()
     try:
         return loop.run_until_complete(coro)
     finally:
         loop.close()
 
-
-async def _run_browser_task(
-    tid: str, sitekey: str, pageurl: str,
-    kind: Literal["turnstile", "recaptcha"],
-    proxy: Optional[str] = None,
-):
+async def _run_browser_task(tid: str, sitekey: str, pageurl: str, kind: Literal["turnstile", "recaptcha"], proxy: Optional[str] = None):
     async with semaphore:
         await store.update(tid, status="processing")
         t0 = time.time()
         try:
             if kind == "turnstile":
-                coro = solve_turnstile(
-                    sitekey=sitekey,
-                    pageurl=pageurl,
-                    timeout=BROWSER_TIMEOUT,
-                    proxy=proxy,
-                    headless=False,  # Xvfb
-                )
+                coro = solve_turnstile(sitekey=sitekey, pageurl=pageurl, timeout=BROWSER_TIMEOUT, proxy=proxy, headless=False)
             else:
-                coro = solve_recaptcha(
-                    sitekey=sitekey,
-                    pageurl=pageurl,
-                    timeout=BROWSER_TIMEOUT,
-                    proxy=proxy,
-                    headless=False,
-                )
+                coro = solve_recaptcha(sitekey=sitekey, pageurl=pageurl, timeout=BROWSER_TIMEOUT, proxy=proxy, headless=False)
 
-            result = await asyncio.get_event_loop().run_in_executor(
-                None, _run_async_in_thread, coro,
-            )
-            if isinstance(result, dict):
-                token = result.get("token", "")
-            else:
-                token = str(result)
+            result = await asyncio.get_event_loop().run_in_executor(None, _run_async_in_thread, coro)
+            token = result.get("token", "") if isinstance(result, dict) else str(result)
 
             if not token:
                 raise RuntimeError("solver_returned_empty_token")
 
-            await store.update(
-                tid, status="done", result=token,
-                elapsed_ms=int((time.time() - t0) * 1000),
-            )
+            await store.update(tid, status="done", result=token, elapsed_ms=int((time.time() - t0) * 1000))
         except Exception as e:
-            await store.update(
-                tid, status="failed", error=str(e)[:500],
-                elapsed_ms=int((time.time() - t0) * 1000),
-            )
-        # Browser cleanup dilakukan di dalam solve_turnstile/solve_recaptcha
-        # via _safe_cleanup(). Task data akan dibersihkan oleh _cleanup_loop
-        # setelah DONE_TASK_TTL.
-
+            await store.update(tid, status="failed", error=str(e)[:500], elapsed_ms=int((time.time() - t0) * 1000))
 
 async def _run_image_task(tid: str, image_b64: str, hint: Optional[str]):
     async with semaphore:
@@ -382,16 +269,9 @@ async def _run_image_task(tid: str, image_b64: str, hint: Optional[str]):
         t0 = time.time()
         try:
             result = await _solve_image_via_vision(image_b64, hint)
-            await store.update(
-                tid, status="done", result=result,
-                elapsed_ms=int((time.time() - t0) * 1000),
-            )
+            await store.update(tid, status="done", result=result, elapsed_ms=int((time.time() - t0) * 1000))
         except Exception as e:
-            await store.update(
-                tid, status="failed", error=str(e)[:500],
-                elapsed_ms=int((time.time() - t0) * 1000),
-            )
-
+            await store.update(tid, status="failed", error=str(e)[:500], elapsed_ms=int((time.time() - t0) * 1000))
 
 # =====================================================================
 # LIFESPAN
@@ -399,27 +279,12 @@ async def _run_image_task(tid: str, image_b64: str, hint: Optional[str]):
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await store.start()
-    print(
-        "[app] started | version=4.2.0 | solver=patchright+xvfb "
-        f"| max_queue={MAX_QUEUE_SIZE} | max_concurrent={MAX_CONCURRENT}",
-        flush=True,
-    )
+    print(f"[app] started | version=4.2.0 | solver=patchright+xvfb | max_queue={MAX_QUEUE_SIZE} | max_concurrent={MAX_CONCURRENT}", flush=True)
     yield
     await store.stop()
 
-
-app = FastAPI(
-    title="Fortress Captcha API",
-    version="4.2.0",
-    lifespan=lifespan,
-)
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
+app = FastAPI(title="Fortress Captcha API", version="4.2.0", lifespan=lifespan)
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 # =====================================================================
 # AUTH
@@ -427,13 +292,9 @@ app.add_middleware(
 def require_api_key(request: Request):
     if not API_KEY:
         return
-    provided = (
-        request.headers.get("x-api-key", "")
-        or request.headers.get("key", "")
-    )
+    provided = request.headers.get("x-api-key", "") or request.headers.get("key", "")
     if provided != API_KEY:
         raise HTTPException(401, "invalid_api_key")
-
 
 # =====================================================================
 # INFO + HEALTH
@@ -441,248 +302,122 @@ def require_api_key(request: Request):
 @app.get("/")
 async def root():
     return {
-        "service": "fortress-captcha",
-        "version": "4.2.0",
-        "solver": "patchright+xvfb",
+        "service": "fortress-captcha", "version": "4.2.0", "solver": "patchright+xvfb",
         "auth_required": bool(API_KEY),
-        "limits": {
-            "max_queue": MAX_QUEUE_SIZE,
-            "max_concurrent": MAX_CONCURRENT,
-            "queue_full_message": QUEUE_FULL_MSG,
-        },
-        "capabilities": {
-            "altcha": True,
-            "friendly": True,
-            "image": True,
-            "turnstile": True,
-            "recaptcha": True,
-            "cloudflare_cookie": True,
-        },
-        "endpoints": {
-            "legacy": ["POST /solve"],
-            "sync": [
-                "POST /v1/solve/altcha",
-                "POST /v1/solve/friendly",
-            ],
-            "async": [
-                "POST /v1/solve/image",
-                "POST /v1/solve/turnstile",
-                "POST /v1/solve/recaptcha",
-            ],
-            "cookie": ["GET /v1/solve/cloudflare?url=..."],
-            "debug": ["POST /v1/debug/turnstile"],
-            "tasks": [
-                "GET /v1/tasks/{id}",
-                "GET /v1/tasks/{id}/wait",
-                "DELETE /v1/tasks/{id}",
-            ],
-            "meta": ["GET /health"],
-        },
+        "limits": {"max_queue": MAX_QUEUE_SIZE, "max_concurrent": MAX_CONCURRENT, "queue_full_message": QUEUE_FULL_MSG},
+        "capabilities": {"altcha": True, "friendly": True, "image": True, "turnstile": True, "recaptcha": True, "cloudflare_cookie": True},
     }
-
 
 @app.get("/health")
 async def health():
     async with store._lock:
-        pending = sum(
-            1 for t in store._tasks.values() if t["status"] == "pending"
-        )
-        processing = sum(
-            1 for t in store._tasks.values() if t["status"] == "processing"
-        )
-        done = sum(
-            1 for t in store._tasks.values() if t["status"] == "done"
-        )
-        failed = sum(
-            1 for t in store._tasks.values() if t["status"] == "failed"
-        )
+        pending = sum(1 for t in store._tasks.values() if t["status"] == "pending")
+        processing = sum(1 for t in store._tasks.values() if t["status"] == "processing")
+        done = sum(1 for t in store._tasks.values() if t["status"] == "done")
+        failed = sum(1 for t in store._tasks.values() if t["status"] == "failed")
         total = len(store._tasks)
 
     async with _legacy_lock:
         legacy_total = len(_legacy_tasks)
 
     return {
-        "status": "ok",
-        "solver": "patchright+xvfb",
-        "tasks": {
-            "total": total,
-            "pending": pending,
-            "processing": processing,
-            "done": done,
-            "failed": failed,
-            "legacy_total": legacy_total,
-        },
-        "queue": {
-            "size": pending,
-            "max": MAX_QUEUE_SIZE,
-            "available": max(0, MAX_QUEUE_SIZE - pending),
-            "full": pending >= MAX_QUEUE_SIZE,
-        },
-        "slots_free": semaphore._value,
-        "ts": time.time(),
+        "status": "ok", "solver": "patchright+xvfb",
+        "tasks": {"total": total, "pending": pending, "processing": processing, "done": done, "failed": failed, "legacy_total": legacy_total},
+        "queue": {"size": pending, "max": MAX_QUEUE_SIZE, "available": max(0, MAX_QUEUE_SIZE - pending), "full": pending >= MAX_QUEUE_SIZE},
+        "slots_free": semaphore._value, "ts": time.time(),
     }
-
 
 # =====================================================================
 # SYNC SOLVERS
 # =====================================================================
 @app.post("/v1/solve/altcha", response_model=AltchaResponse)
-async def solve_altcha_endpoint(
-    req: AltchaRequest, _=Depends(require_api_key)
-):
+async def solve_altcha_endpoint(req: AltchaRequest, _=Depends(require_api_key)):
     t0 = time.time()
     try:
-        sol, iters = await asyncio.get_event_loop().run_in_executor(
-            None, _solve_altcha, req.challenge
-        )
+        sol, iters = await asyncio.get_event_loop().run_in_executor(None, _solve_altcha, req.challenge)
     except ValueError as e:
         raise HTTPException(422, str(e))
-    return AltchaResponse(
-        solution=sol, iterations=iters,
-        elapsed_ms=int((time.time() - t0) * 1000),
-    )
-
+    return AltchaResponse(solution=sol, iterations=iters, elapsed_ms=int((time.time() - t0) * 1000))
 
 @app.post("/v1/solve/friendly", response_model=FriendlyResponse)
-async def solve_friendly_endpoint(
-    req: FriendlyRequest, _=Depends(require_api_key)
-):
+async def solve_friendly_endpoint(req: FriendlyRequest, _=Depends(require_api_key)):
     t0 = time.time()
     try:
-        sol, nonce = await asyncio.get_event_loop().run_in_executor(
-            None, _solve_friendly,
-            req.challenge, req.difficulty, req.max_nonce,
-        )
+        sol, nonce = await asyncio.get_event_loop().run_in_executor(None, _solve_friendly, req.challenge, req.difficulty, req.max_nonce)
     except ValueError as e:
         raise HTTPException(422, str(e))
-    return FriendlyResponse(
-        solution=sol, nonce=nonce,
-        elapsed_ms=int((time.time() - t0) * 1000),
-    )
-
+    return FriendlyResponse(solution=sol, nonce=nonce, elapsed_ms=int((time.time() - t0) * 1000))
 
 # =====================================================================
 # ASYNC ENDPOINTS
 # =====================================================================
 @app.post("/v1/solve/image", response_model=TaskResponse, status_code=202)
-async def submit_image(
-    req: ImageRequest, bg: BackgroundTasks,
-    _=Depends(require_api_key),
-):
+async def submit_image(req: ImageRequest, bg: BackgroundTasks, _=Depends(require_api_key)):
     tid = await store.create_if_slot("image")
     if not tid:
         raise HTTPException(429, QUEUE_FULL_MSG)
     bg.add_task(_run_image_task, tid, req.image_base64, req.hint)
     return TaskResponse(**await store.get(tid))
 
-
 @app.post("/v1/solve/turnstile", response_model=TaskResponse, status_code=202)
-async def submit_turnstile(
-    req: BrowserRequest, bg: BackgroundTasks,
-    _=Depends(require_api_key),
-):
+async def submit_turnstile(req: BrowserRequest, bg: BackgroundTasks, _=Depends(require_api_key)):
     if not req.sitekey or not req.pageurl:
         raise HTTPException(400, "sitekey_and_pageurl_required")
     tid = await store.create_if_slot("turnstile")
     if not tid:
         raise HTTPException(429, QUEUE_FULL_MSG)
-    bg.add_task(
-        _run_browser_task,
-        tid, req.sitekey, req.pageurl, "turnstile", req.proxy,
-    )
+    bg.add_task(_run_browser_task, tid, req.sitekey, req.pageurl, "turnstile", req.proxy)
     return TaskResponse(**await store.get(tid))
 
-
 @app.post("/v1/solve/recaptcha", response_model=TaskResponse, status_code=202)
-async def submit_recaptcha(
-    req: BrowserRequest, bg: BackgroundTasks,
-    _=Depends(require_api_key),
-):
+async def submit_recaptcha(req: BrowserRequest, bg: BackgroundTasks, _=Depends(require_api_key)):
     if not req.sitekey or not req.pageurl:
         raise HTTPException(400, "sitekey_and_pageurl_required")
     tid = await store.create_if_slot("recaptcha")
     if not tid:
         raise HTTPException(429, QUEUE_FULL_MSG)
-    bg.add_task(
-        _run_browser_task,
-        tid, req.sitekey, req.pageurl, "recaptcha", req.proxy,
-    )
+    bg.add_task(_run_browser_task, tid, req.sitekey, req.pageurl, "recaptcha", req.proxy)
     return TaskResponse(**await store.get(tid))
-
 
 # =====================================================================
 # CLOUDFLARE COOKIE ENDPOINT
 # =====================================================================
 @app.get("/v1/solve/cloudflare")
-async def solve_cloudflare(
-    url: str,
-    proxy: Optional[str] = None,
-    _=Depends(require_api_key),
-):
+async def solve_cloudflare(url: str, proxy: Optional[str] = None, _=Depends(require_api_key)):
     if not url:
         raise HTTPException(400, "url_required")
-
     try:
         result = await asyncio.get_event_loop().run_in_executor(
-            None,
-            _run_async_in_thread,
-            get_cloudflare_cookie(
-                url=url, timeout=60, proxy=proxy, headless=False,
-            ),
+            None, _run_async_in_thread, get_cloudflare_cookie(url=url, timeout=60, proxy=proxy, headless=False)
         )
     except Exception as e:
         raise HTTPException(500, str(e))
 
     cookies = result.get("cookies", {})
     cookie_header = "; ".join(f"{k}={v}" for k, v in cookies.items())
-
     return {
-        "url": url,
-        "status": "ok",
-        "cookies": cookies,
-        "cookie_header": cookie_header,
-        "cf_clearance": cookies.get("cf_clearance", ""),
-        "has_cf_clearance": bool(cookies.get("cf_clearance")),
-        "user_agent": result.get("user_agent", ""),
-        "html_length": len(result.get("html", "")),
-        "final_url": result.get("final_url", url),
+        "url": url, "status": "ok", "cookies": cookies, "cookie_header": cookie_header,
+        "cf_clearance": cookies.get("cf_clearance", ""), "has_cf_clearance": bool(cookies.get("cf_clearance")),
+        "user_agent": result.get("user_agent", ""), "html_length": len(result.get("html", "")), "final_url": result.get("final_url", url),
     }
-
 
 # =====================================================================
 # DEBUG ENDPOINTS
 # =====================================================================
 @app.post("/v1/debug/turnstile")
-async def debug_turnstile(
-    body: dict = Body(...),
-    _=Depends(require_api_key),
-):
-    """
-    Debug Turnstile: return screenshot + iframe list + console logs.
-    Body: {"sitekey": "0x...", "pageurl": "https://...", "timeout": 30}
-    """
+async def debug_turnstile(body: dict = Body(...), _=Depends(require_api_key)):
     sitekey = body.get("sitekey", "")
     pageurl = body.get("pageurl", "")
     timeout = int(body.get("timeout", 30))
-
     if not pageurl:
         raise HTTPException(400, "pageurl_required")
-
     try:
         result = await asyncio.get_event_loop().run_in_executor(
-            None,
-            _run_async_in_thread,
-            solve_turnstile(
-                sitekey=sitekey or "0x0",
-                pageurl=pageurl,
-                timeout=timeout,
-                headless=False,
-            ),
+            None, _run_async_in_thread, solve_turnstile(sitekey=sitekey or "0x0", pageurl=pageurl, timeout=timeout, headless=False)
         )
         return {"status": "ok", "result": result}
     except Exception as e:
         return {"status": "error", "error": str(e)[:800]}
-
 
 # =====================================================================
 # TASK MANAGEMENT
@@ -694,12 +429,8 @@ async def get_task(tid: str, _=Depends(require_api_key)):
         raise HTTPException(404, "task_not_found")
     return TaskResponse(**t)
 
-
 @app.get("/v1/tasks/{tid}/wait", response_model=TaskResponse)
-async def wait_task(
-    tid: str, timeout: int = 60,
-    _=Depends(require_api_key),
-):
+async def wait_task(tid: str, timeout: int = 60, _=Depends(require_api_key)):
     if timeout > 300:
         raise HTTPException(400, "timeout_max_300")
     deadline = time.time() + timeout
@@ -715,47 +446,26 @@ async def wait_task(
         raise HTTPException(404, "task_not_found")
     return TaskResponse(**t)
 
-
 @app.delete("/v1/tasks/{tid}")
 async def delete_task(tid: str, _=Depends(require_api_key)):
     if not await store.delete(tid):
         raise HTTPException(404, "task_not_found")
     return {"deleted": tid}
 
-
 # =====================================================================
 # LEGACY /solve
 # =====================================================================
-# (globals _legacy_tasks dan _legacy_lock dideklarasikan di atas, sebelum
-#  TaskStore, agar bisa dipakai oleh _cleanup_loop)
-
 def _legacy_response(tid: str, task: dict) -> dict:
     status = task.get("status", "pending")
     if status == "done":
         result = task.get("result") or ""
-        return {
-            "taskId": tid,
-            "status": "done",
-            "token": result,
-            "solution": {"token": result},
-        }
+        return {"taskId": tid, "status": "done", "token": result, "solution": {"token": result}}
     if status == "failed":
-        return {
-            "taskId": tid,
-            "status": "error",
-            "error": task.get("error") or "failed",
-        }
+        return {"taskId": tid, "status": "error", "error": task.get("error") or "failed"}
     return {"taskId": tid, "status": status}
 
-
 def _legacy_queue_full() -> dict:
-    return {
-        "taskId": None,
-        "status": "error",
-        "error": "queue_full",
-        "message": QUEUE_FULL_MSG,
-    }
-
+    return {"taskId": None, "status": "error", "error": "queue_full", "message": QUEUE_FULL_MSG}
 
 @app.post("/solve")
 async def legacy_solve(body: dict = Body(...)):
@@ -766,183 +476,86 @@ async def legacy_solve(body: dict = Body(...)):
         if not t:
             t = await store.get(tid)
         if not t:
-            return {
-                "status": "error", "error": "task_not_found",
-                "message": "task id not found",
-            }
+            return {"status": "error", "error": "task_not_found", "message": "task id not found"}
         return _legacy_response(tid, t)
 
     ttype = (body.get("type") or "").lower()
-    challenge_raw = (
-        body.get("challenge")
-        or body.get("challengeData")
-        or body.get("data")
-    )
+    challenge_raw = body.get("challenge") or body.get("challengeData") or body.get("data")
 
-    # ALTCHA
-    if ttype == "altcha" or (
-        isinstance(challenge_raw, dict) and "salt" in challenge_raw
-    ):
+    if ttype == "altcha" or (isinstance(challenge_raw, dict) and "salt" in challenge_raw):
         tid = str(uuid.uuid4())
         async with _legacy_lock:
-            _legacy_tasks[tid] = {
-                "id": tid, "type": "altcha", "status": "pending",
-                "result": None, "error": None,
-                # NEW: created_at agar _cleanup_loop bisa prune
-                "created_at": time.time(),
-            }
+            _legacy_tasks[tid] = {"id": tid, "type": "altcha", "status": "pending", "result": None, "error": None, "created_at": time.time()}
         try:
-            ch = (
-                challenge_raw
-                if isinstance(challenge_raw, dict)
-                else json.loads(challenge_raw)
-            )
+            ch = challenge_raw if isinstance(challenge_raw, dict) else json.loads(challenge_raw)
             req = AltchaChallenge(**ch)
-            sol, _ = await asyncio.get_event_loop().run_in_executor(
-                None, _solve_altcha, req
-            )
+            sol, _ = await asyncio.get_event_loop().run_in_executor(None, _solve_altcha, req)
             async with _legacy_lock:
                 _legacy_tasks[tid].update(status="done", result=sol)
         except Exception as e:
             async with _legacy_lock:
-                _legacy_tasks[tid].update(
-                    status="failed", error=str(e)[:300]
-                )
+                _legacy_tasks[tid].update(status="failed", error=str(e)[:300])
         async with _legacy_lock:
             task = dict(_legacy_tasks[tid])
         return _legacy_response(tid, task)
 
-    # Friendly
-    if ttype == "friendly" or (
-        isinstance(challenge_raw, str)
-        and ttype in ("", "friendly")
-        and challenge_raw
-    ):
+    if ttype == "friendly" or (isinstance(challenge_raw, str) and ttype in ("", "friendly") and challenge_raw):
         tid = str(uuid.uuid4())
         async with _legacy_lock:
-            _legacy_tasks[tid] = {
-                "id": tid, "type": "friendly", "status": "pending",
-                "result": None, "error": None,
-                # NEW: created_at agar _cleanup_loop bisa prune
-                "created_at": time.time(),
-            }
+            _legacy_tasks[tid] = {"id": tid, "type": "friendly", "status": "pending", "result": None, "error": None, "created_at": time.time()}
         try:
-            ch_b64 = (
-                challenge_raw
-                if isinstance(challenge_raw, str)
-                else json.dumps(challenge_raw)
-            )
+            ch_b64 = challenge_raw if isinstance(challenge_raw, str) else json.dumps(challenge_raw)
             diff = int(body.get("difficulty") or 16)
-            max_nonce = int(
-                body.get("max_nonce") or body.get("maxNonce") or 10_000_000
-            )
-            sol, _ = await asyncio.get_event_loop().run_in_executor(
-                None, _solve_friendly, ch_b64, diff, max_nonce
-            )
+            max_nonce = int(body.get("max_nonce") or body.get("maxNonce") or 10_000_000)
+            sol, _ = await asyncio.get_event_loop().run_in_executor(None, _solve_friendly, ch_b64, diff, max_nonce)
             async with _legacy_lock:
                 _legacy_tasks[tid].update(status="done", result=sol)
         except Exception as e:
             async with _legacy_lock:
-                _legacy_tasks[tid].update(
-                    status="failed", error=str(e)[:300]
-                )
+                _legacy_tasks[tid].update(status="failed", error=str(e)[:300])
         async with _legacy_lock:
             task = dict(_legacy_tasks[tid])
         return _legacy_response(tid, task)
 
-    # Image
-    image_b64 = (
-        body.get("image")
-        or body.get("imageBase64")
-        or body.get("image_base64")
-        or body.get("body")
-    )
-    if ttype in ("image", "base64", "normal") or (
-        image_b64 and ttype not in ("turnstile", "recaptcha", "hcaptcha")
-    ):
+    image_b64 = body.get("image") or body.get("imageBase64") or body.get("image_base64") or body.get("body")
+    if ttype in ("image", "base64", "normal") or (image_b64 and ttype not in ("turnstile", "recaptcha", "hcaptcha")):
         if not image_b64:
-            return {
-                "taskId": None, "status": "error",
-                "error": "missing_image",
-                "message": "image field required",
-            }
+            return {"taskId": None, "status": "error", "error": "missing_image", "message": "image field required"}
         tid = await store.create_if_slot("image")
         if not tid:
             return _legacy_queue_full()
-        asyncio.create_task(
-            _run_image_task(tid, image_b64, body.get("hint"))
-        )
+        asyncio.create_task(_run_image_task(tid, image_b64, body.get("hint")))
         return {"taskId": tid, "status": "pending"}
 
-    # Turnstile
     if ttype == "turnstile":
-        sitekey = (
-            body.get("siteKey") or body.get("sitekey")
-            or body.get("googlekey") or ""
-        )
-        pageurl = (
-            body.get("domain") or body.get("url")
-            or body.get("pageurl") or ""
-        )
+        sitekey = body.get("siteKey") or body.get("sitekey") or body.get("googlekey") or ""
+        pageurl = body.get("domain") or body.get("url") or body.get("pageurl") or ""
         if not sitekey or not pageurl:
-            return {
-                "taskId": None, "status": "error",
-                "error": "missing_params",
-                "message": "siteKey dan domain wajib diisi",
-            }
+            return {"taskId": None, "status": "error", "error": "missing_params", "message": "siteKey dan domain wajib diisi"}
         tid = await store.create_if_slot("turnstile")
         if not tid:
             return _legacy_queue_full()
-        asyncio.create_task(
-            _run_browser_task(
-                tid, sitekey, pageurl, "turnstile", body.get("proxy")
-            )
-        )
+        asyncio.create_task(_run_browser_task(tid, sitekey, pageurl, "turnstile", body.get("proxy")))
         return {"taskId": tid, "status": "pending"}
 
-    # reCAPTCHA v2
     if ttype in ("recaptcha", "userrecaptcha", "recaptcha_v2"):
-        sitekey = (
-            body.get("siteKey") or body.get("sitekey")
-            or body.get("googlekey") or ""
-        )
-        pageurl = (
-            body.get("domain") or body.get("url")
-            or body.get("pageurl") or ""
-        )
+        sitekey = body.get("siteKey") or body.get("sitekey") or body.get("googlekey") or ""
+        pageurl = body.get("domain") or body.get("url") or body.get("pageurl") or ""
         if not sitekey or not pageurl:
-            return {
-                "taskId": None, "status": "error",
-                "error": "missing_params",
-                "message": "siteKey dan domain wajib diisi",
-            }
+            return {"taskId": None, "status": "error", "error": "missing_params", "message": "siteKey dan domain wajib diisi"}
         tid = await store.create_if_slot("recaptcha")
         if not tid:
             return _legacy_queue_full()
-        asyncio.create_task(
-            _run_browser_task(
-                tid, sitekey, pageurl, "recaptcha", body.get("proxy")
-            )
-        )
+        asyncio.create_task(_run_browser_task(tid, sitekey, pageurl, "recaptcha", body.get("proxy")))
         return {"taskId": tid, "status": "pending"}
 
     if ttype in ("hcaptcha", "recaptcha_v3"):
-        return {
-            "taskId": None, "status": "error",
-            "error": "unsupported_type",
-            "message": f"'{ttype}' belum didukung.",
-        }
+        return {"taskId": None, "status": "error", "error": "unsupported_type", "message": f"'{ttype}' belum didukung."}
 
-    return {
-        "taskId": None, "status": "error",
-        "error": "unknown_type",
-        "message": f"unsupported type: '{ttype}'. "
-                   f"Valid: altcha, friendly, image, turnstile, recaptcha",
-    }
-
+    return {"taskId": None, "status": "error", "error": "unknown_type", "message": f"unsupported type: '{ttype}'. Valid: altcha, friendly, image, turnstile, recaptcha"}
 
 # =====================================================================
-# TEST PAGE
+# TEST PAGE & DIRECT RUN
 # =====================================================================
 @app.get("/test", include_in_schema=False)
 async def test_page():
@@ -956,10 +569,6 @@ async def test_page():
         "</body></html>"
     ))
 
-
-# =====================================================================
-# DIRECT RUN
-# =====================================================================
 if __name__ == "__main__":
     import uvicorn
     port = int(os.getenv("PORT", "8080"))
