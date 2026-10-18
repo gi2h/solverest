@@ -1,6 +1,6 @@
 """
 Turnstile + reCAPTCHA solver using Patchright + Xvfb.
-v2.4 - Accept 709-char tokens, DNS fallback, CSP bypass.
+v2.5 - Stable release: Reverted slow CSP bypass, accepts 709-char tokens.
 """
 from __future__ import annotations
 
@@ -55,6 +55,7 @@ BROWSER_CLOSE_TIMEOUT = float(os.getenv("BROWSER_CLOSE_TIMEOUT", "10"))
 
 
 def _launch_args() -> list:
+    # Dikembalikan ke argumen standar (tanpa --disable-ipv6)
     return [
         "--disable-blink-features=AutomationControlled",
         "--no-sandbox",
@@ -66,7 +67,6 @@ def _launch_args() -> list:
         "--disable-features=IsolateOrigins,site-per-process",
         "--window-size=1280,800",
         "--start-maximized",
-        "--disable-ipv6", # Fix ERR_NAME_NOT_RESOLVED on Railway/Docker
     ]
 
 
@@ -76,34 +76,6 @@ def _start_xvfb():
     display.start()
     log.info("xvfb started DISPLAY=%s", os.environ.get("DISPLAY"))
     return display
-
-
-def _setup_page_listeners(page):
-    """Log error browser, CSP, dan request yang gagal."""
-    page.on("console", lambda msg: log.info(f"[console] {msg.type}: {msg.text}"))
-    page.on("pageerror", lambda err: log.info(f"[pageerror] {err}"))
-    
-    def on_req_fail(req):
-        fail = req.failure
-        if fail == "net::ERR_NAME_NOT_RESOLVED":
-            log.warning(f"[reqfail] DNS Error (Blocked by ISP/Railway?): {req.url[:80]}")
-        else:
-            log.info(f"[reqfail] {req.url[:80]} - {fail}")
-            
-    page.on("requestfailed", on_req_fail)
-
-
-async def _bypass_csp(route):
-    """Intersepsi dan hapus CSP & X-Frame-Options agar iframe Cloudflare bisa dimuat."""
-    try:
-        response = await route.fetch()
-        headers = response.headers
-        headers.pop("content-security-policy", None)
-        headers.pop("content-security-policy-report-only", None)
-        headers.pop("x-frame-options", None)
-        await route.fulfill(response=response, headers=headers)
-    except Exception:
-        await route.continue_()
 
 
 async def _new_context(browser):
@@ -143,12 +115,12 @@ async def _safe_cleanup(page, context, browser):
 
 
 async def _read_token(page, input_name: str) -> Optional[str]:
-    """Kembalikan token jika panjangnya > 50 (Menerima token 709 karakter)."""
+    """Kembalikan token jika panjangnya > 20 (Menerima token 709 karakter)."""
     try:
         return await page.evaluate(
             """(name) => {
                 const el = document.querySelector('[name="' + name + '"]');
-                return (el && el.value && el.value.length > 50) ? el.value : null;
+                return (el && el.value && el.value.length > 20) ? el.value : null;
             }""",
             input_name,
         )
@@ -295,10 +267,8 @@ async def solve_turnstile(
             page = None
             try:
                 context = await _new_context(browser)
-                await context.route("**/*", _bypass_csp)
                 await context.add_init_script(STEALTH_JS)
                 page = await context.new_page()
-                _setup_page_listeners(page)
 
                 log.info("turnstile: navigating to %s", pageurl)
                 try:
@@ -316,9 +286,10 @@ async def solve_turnstile(
                     stats.get("isCfChallenge", False),
                 )
 
+                # Cek early token (auto-solve)
                 token = await _read_token(page, "cf-turnstile-response")
                 if token:
-                    log.info("turnstile: valid token present early len=%d", len(token))
+                    log.info("turnstile: token present early len=%d", len(token))
                     return {"token": token, "debug": {"early": True}}
 
                 log.info("turnstile: waiting for token (timeout=%ds)", timeout)
@@ -327,37 +298,19 @@ async def solve_turnstile(
                 clicked = False
                 attempts = 0
                 last_log = 0
-                render_attempted = False
 
                 while asyncio.get_event_loop().time() < deadline:
                     attempts += 1
 
                     token = await _read_token(page, "cf-turnstile-response")
                     if token:
-                        log.info("turnstile: valid token acquired len=%d at attempt %d", len(token), attempts)
+                        log.info("turnstile: token acquired len=%d at attempt %d", len(token), attempts)
                         return {"token": token, "debug": {"attempts": attempts}}
 
                     if not iframe_el:
                         iframe_el = await _find_turnstile_iframe(page)
                         if iframe_el and not clicked:
                             clicked = await _click_widget(page, iframe_el)
-
-                    if not iframe_el and not render_attempted and attempts >= 10:
-                        render_attempted = True
-                        log.info("turnstile: no iframe detected, forcing manual render...")
-                        await page.evaluate("""
-                            () => {
-                                if (window.turnstile && window.turnstile.render) {
-                                    const div = document.querySelector('.cf-turnstile');
-                                    if (div && div.innerHTML.trim() === '') {
-                                        try {
-                                            const key = div.getAttribute('data-sitekey');
-                                            if (key) window.turnstile.render(div, { sitekey: key });
-                                        } catch(e) {}
-                                    }
-                                }
-                            }
-                        """)
 
                     if attempts - last_log >= 10:
                         last_log = attempts
@@ -421,10 +374,8 @@ async def solve_recaptcha(
             page = None
             try:
                 context = await _new_context(browser)
-                await context.route("**/*", _bypass_csp)
                 await context.add_init_script(STEALTH_JS)
                 page = await context.new_page()
-                _setup_page_listeners(page)
 
                 await page.goto(pageurl, wait_until="domcontentloaded", timeout=30000)
                 await asyncio.sleep(3)
@@ -492,10 +443,8 @@ async def get_cloudflare_cookie(
             page = None
             try:
                 context = await _new_context(browser)
-                await context.route("**/*", _bypass_csp)
                 await context.add_init_script(STEALTH_JS)
                 page = await context.new_page()
-                _setup_page_listeners(page)
 
                 await page.goto(url, wait_until="domcontentloaded", timeout=30000)
                 await asyncio.sleep(3)
