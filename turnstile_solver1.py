@@ -1,6 +1,6 @@
 """
 Turnstile + reCAPTCHA solver using Patchright + Xvfb.
-v3.1 - Proactive WAF interaction & robust checks.
+v3.2 - Complete file, WAF interaction, fixed imports.
 """
 from __future__ import annotations
 
@@ -123,7 +123,6 @@ async def _read_token(page, input_name: str) -> Optional[str]:
 
 
 async def _is_waf_active(page) -> bool:
-    """Mendeteksi halaman 'Just a moment' atau Checkbox WAF."""
     try:
         return await page.evaluate("""
             () => {
@@ -135,7 +134,6 @@ async def _is_waf_active(page) -> bool:
                 if (document.querySelector("#challenge-form") || document.querySelector("#challenge-stage")) {
                     return true;
                 }
-                // Cek iframe challenge cloudflare
                 const iframes = Array.from(document.querySelectorAll('iframe'));
                 for (let iframe of iframes) {
                     if (iframe.src && iframe.src.includes('challenges.cloudflare.com')) {
@@ -150,9 +148,7 @@ async def _is_waf_active(page) -> bool:
 
 
 async def _click_waf_checkbox(page) -> bool:
-    """Mencoba mengklik checkbox di dalam iframe WAF Cloudflare."""
     try:
-        # Cari iframe WAF (biasanya ukurannya di tengah layar)
         iframe_el = await page.query_selector('iframe[src*="challenges.cloudflare.com"]')
         if iframe_el:
             box = await iframe_el.bounding_box()
@@ -162,8 +158,8 @@ async def _click_waf_checkbox(page) -> bool:
                 await page.mouse.click(cx, cy)
                 log.info("WAF: clicked checkbox at (%.0f, %.0f)", cx, cy)
                 return True
-    except Exception as e:
-        log.debug("WAF click error: %s", e)
+    except Exception:
+        pass
     return False
 
 
@@ -213,8 +209,8 @@ async def solve_turnstile(
                 waf_attempts = 0
                 while await _is_waf_active(page):
                     waf_attempts += 1
-                    if waf_attempts > 8: # Max ~32 detik
-                        raise RuntimeError("waf_bypass_timeout (Cloudflare blocked datacenter IP)")
+                    if waf_attempts > 8: 
+                        raise RuntimeError("waf_bypass_timeout (Cloudflare blocked datacenter IP. Provide a proxy.)")
                     
                     log.info("turnstile: WAF detected, trying to interact... (%d/8)", waf_attempts)
                     await _click_waf_checkbox(page)
@@ -250,5 +246,120 @@ async def solve_turnstile(
             except Exception: pass
 
 
-# ... (solve_recaptcha dan get_cloudflare_cookie biarkan sama seperti v3.0) ...
-# Saya singkat di sini agar fokus ke Turnstile/WAF
+async def solve_recaptcha(
+    sitekey: str,
+    pageurl: str,
+    timeout: int = 90,
+    proxy: Optional[str] = None,
+    headless: bool = False,
+) -> dict:
+    try:
+        from patchright.async_api import async_playwright
+    except ImportError as e:
+        raise RuntimeError(f"patchright_not_installed: {e}")
+
+    display = None
+    if not headless:
+        try:
+            display = _start_xvfb()
+        except Exception as e:
+            log.warning("xvfb failed: %s", e)
+            headless = True
+
+    try:
+        launch_opts = {"headless": headless, "args": _launch_args(), "chromium_sandbox": False}
+        if proxy:
+            launch_opts["proxy"] = {"server": proxy}
+
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(**launch_opts)
+            context = None
+            page = None
+            try:
+                context = await _new_context(browser)
+                await context.add_init_script(STEALTH_JS)
+                page = await context.new_page()
+
+                await page.goto(pageurl, wait_until="domcontentloaded", timeout=30000)
+                await asyncio.sleep(3)
+
+                deadline = asyncio.get_event_loop().time() + timeout
+                while asyncio.get_event_loop().time() < deadline:
+                    token = await _read_token(page, "g-recaptcha-response")
+                    if token:
+                        cookies = await context.cookies()
+                        cookie_dict = {c["name"]: c["value"] for c in cookies}
+                        return {"token": token, "cookies": cookie_dict, "user_agent": USER_AGENT}
+                    await asyncio.sleep(1)
+
+                raise RuntimeError("recaptcha_token_timeout")
+
+            finally:
+                await _safe_cleanup(page, context, browser)
+    finally:
+        if display:
+            try: display.stop()
+            except Exception: pass
+
+
+async def get_cloudflare_cookie(
+    url: str,
+    timeout: int = 60,
+    proxy: Optional[str] = None,
+    headless: bool = False,
+) -> dict:
+    try:
+        from patchright.async_api import async_playwright
+    except ImportError as e:
+        raise RuntimeError(f"patchright_not_installed: {e}")
+
+    display = None
+    if not headless:
+        try:
+            display = _start_xvfb()
+        except Exception as e:
+            log.warning("xvfb failed: %s", e)
+            headless = True
+
+    try:
+        launch_opts = {"headless": headless, "args": _launch_args(), "chromium_sandbox": False}
+        if proxy:
+            launch_opts["proxy"] = {"server": proxy}
+
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(**launch_opts)
+            context = None
+            page = None
+            try:
+                context = await _new_context(browser)
+                await context.add_init_script(STEALTH_JS)
+                page = await context.new_page()
+
+                await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+                await asyncio.sleep(3)
+
+                deadline = asyncio.get_event_loop().time() + timeout
+                while asyncio.get_event_loop().time() < deadline:
+                    cookies = await context.cookies()
+                    names = {c["name"] for c in cookies}
+                    if "cf_clearance" in names:
+                        break
+                    await asyncio.sleep(1)
+
+                cookies = await context.cookies()
+                cookie_dict = {c["name"]: c["value"] for c in cookies}
+                html = await page.content()
+
+                return {
+                    "cookies": cookie_dict,
+                    "user_agent": USER_AGENT,
+                    "html": html,
+                    "final_url": page.url,
+                }
+
+            finally:
+                await _safe_cleanup(page, context, browser)
+    finally:
+        if display:
+            try: display.stop()
+            except Exception: pass
