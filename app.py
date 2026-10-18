@@ -1,5 +1,12 @@
 """
-Fortress Captcha API v4.1 - Patchright + Xvfb solver.
+Fortress Captcha API v4.2 - Patchright + Xvfb solver.
+
+Changelog v4.2:
+  - MAX_QUEUE_SIZE = 6 (queue penuh → "slot habis, ulangi lagi nanti")
+  - Atomic create_if_slot() untuk hindari race condition
+  - Cleanup agresif: task done/failed dihapus setelah DONE_TASK_TTL
+  - Cleanup _legacy_tasks (ALTCHA/Friendly) yang sebelumnya bocor
+  - /health menampilkan status queue
 
 Changelog v4.1:
   - Non-headless Chromium via Xvfb (bypass headless detection)
@@ -65,10 +72,17 @@ VISION_URL = os.getenv(
     "VISION_URL", "http://vision-solver.railway.internal:9002"
 )
 TASK_TTL = int(os.getenv("TASK_TTL_SECONDS", "3600"))
+# Task done/failed dibersihkan lebih cepat (browser sudah ditutup solver,
+# data hasil tidak berguna lagi setelah client ambil).
+DONE_TASK_TTL = int(os.getenv("DONE_TASK_TTL_SECONDS", "600"))
 MAX_CONCURRENT = int(os.getenv("MAX_CONCURRENT_SOLVES", "2"))
+# Batas queue pending. Jika penuh → "slot habis, ulangi lagi nanti"
+MAX_QUEUE_SIZE = int(os.getenv("MAX_QUEUE_SIZE", "6"))
 SOLVE_TIMEOUT = int(os.getenv("SOLVE_TIMEOUT", "180"))
 BROWSER_TIMEOUT = int(os.getenv("BROWSER_TIMEOUT", "90"))
 API_KEY = os.getenv("API_KEY", "")
+
+QUEUE_FULL_MSG = "slot habis, ulangi lagi nanti"
 
 
 # =====================================================================
@@ -127,6 +141,14 @@ class TaskResponse(BaseModel):
 
 
 # =====================================================================
+# LEGACY STORE (ALTCHA/Friendly sync) - dideklarasikan lebih dulu
+# karena dipakai oleh TaskStore._cleanup_loop()
+# =====================================================================
+_legacy_tasks: dict[str, dict[str, Any]] = {}
+_legacy_lock = asyncio.Lock()
+
+
+# =====================================================================
 # TASK STORE
 # =====================================================================
 class TaskStore:
@@ -156,6 +178,27 @@ class TaskStore:
             }
         return tid
 
+    async def create_if_slot(self, task_type: str) -> Optional[str]:
+        """Atomic check-and-create.
+
+        Return task id jika queue masih ada slot, None jika queue penuh
+        (>= MAX_QUEUE_SIZE pending). Mencegah race condition antara cek
+        dan create saat banyak request bersamaan.
+        """
+        async with self._lock:
+            pending = sum(
+                1 for t in self._tasks.values() if t["status"] == "pending"
+            )
+            if pending >= MAX_QUEUE_SIZE:
+                return None
+            tid = str(uuid.uuid4())
+            self._tasks[tid] = {
+                "id": tid, "type": task_type, "status": "pending",
+                "result": None, "error": None, "elapsed_ms": None,
+                "created_at": time.time(), "updated_at": time.time(),
+            }
+            return tid
+
     async def get(self, tid: str) -> Optional[dict]:
         async with self._lock:
             return dict(self._tasks[tid]) if tid in self._tasks else None
@@ -171,15 +214,44 @@ class TaskStore:
             return self._tasks.pop(tid, None) is not None
 
     async def _cleanup_loop(self):
+        # Dijalankan tiap 30 detik. Dua cutoff:
+        #  - pending/processing : TASK_TTL (default 3600s)
+        #  - done/failed        : DONE_TASK_TTL (default 600s)
+        # Browser cleanup sudah ditangani turnstile_solver1._safe_cleanup().
         while True:
-            await asyncio.sleep(60)
-            cutoff = time.time() - TASK_TTL
+            await asyncio.sleep(30)
+            now = time.time()
+            pending_cutoff = now - TASK_TTL
+            done_cutoff = now - DONE_TASK_TTL
+
+            # 1. Cleanup main task store
             async with self._lock:
-                for k in [
-                    k for k, v in self._tasks.items()
-                    if v["created_at"] < cutoff
-                ]:
+                to_delete = []
+                for k, v in self._tasks.items():
+                    if v["status"] in ("done", "failed"):
+                        if v["updated_at"] < done_cutoff:
+                            to_delete.append(k)
+                    else:
+                        if v["created_at"] < pending_cutoff:
+                            to_delete.append(k)
+                for k in to_delete:
                     self._tasks.pop(k, None)
+
+            # 2. Cleanup legacy ALTCHA/Friendly tasks
+            #    (sebelumnya bocor selamanya di memori)
+            if _legacy_tasks:
+                async with _legacy_lock:
+                    legacy_delete = []
+                    for k, v in _legacy_tasks.items():
+                        created = v.get("created_at", 0)
+                        if v.get("status") in ("done", "failed"):
+                            if created < done_cutoff:
+                                legacy_delete.append(k)
+                        else:
+                            if created < pending_cutoff:
+                                legacy_delete.append(k)
+                    for k in legacy_delete:
+                        _legacy_tasks.pop(k, None)
 
 
 store = TaskStore()
@@ -299,6 +371,9 @@ async def _run_browser_task(
                 tid, status="failed", error=str(e)[:500],
                 elapsed_ms=int((time.time() - t0) * 1000),
             )
+        # Browser cleanup dilakukan di dalam solve_turnstile/solve_recaptcha
+        # via _safe_cleanup(). Task data akan dibersihkan oleh _cleanup_loop
+        # setelah DONE_TASK_TTL.
 
 
 async def _run_image_task(tid: str, image_b64: str, hint: Optional[str]):
@@ -325,7 +400,8 @@ async def _run_image_task(tid: str, image_b64: str, hint: Optional[str]):
 async def lifespan(app: FastAPI):
     await store.start()
     print(
-        "[app] started | version=4.1.0 | solver=patchright+xvfb",
+        "[app] started | version=4.2.0 | solver=patchright+xvfb "
+        f"| max_queue={MAX_QUEUE_SIZE} | max_concurrent={MAX_CONCURRENT}",
         flush=True,
     )
     yield
@@ -334,7 +410,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Fortress Captcha API",
-    version="4.1.0",
+    version="4.2.0",
     lifespan=lifespan,
 )
 app.add_middleware(
@@ -366,9 +442,14 @@ def require_api_key(request: Request):
 async def root():
     return {
         "service": "fortress-captcha",
-        "version": "4.1.0",
+        "version": "4.2.0",
         "solver": "patchright+xvfb",
         "auth_required": bool(API_KEY),
+        "limits": {
+            "max_queue": MAX_QUEUE_SIZE,
+            "max_concurrent": MAX_CONCURRENT,
+            "queue_full_message": QUEUE_FULL_MSG,
+        },
         "capabilities": {
             "altcha": True,
             "friendly": True,
@@ -406,18 +487,36 @@ async def health():
         pending = sum(
             1 for t in store._tasks.values() if t["status"] == "pending"
         )
+        processing = sum(
+            1 for t in store._tasks.values() if t["status"] == "processing"
+        )
         done = sum(
             1 for t in store._tasks.values() if t["status"] == "done"
         )
         failed = sum(
             1 for t in store._tasks.values() if t["status"] == "failed"
         )
+        total = len(store._tasks)
+
+    async with _legacy_lock:
+        legacy_total = len(_legacy_tasks)
+
     return {
         "status": "ok",
         "solver": "patchright+xvfb",
         "tasks": {
-            "total": len(store._tasks),
-            "pending": pending, "done": done, "failed": failed,
+            "total": total,
+            "pending": pending,
+            "processing": processing,
+            "done": done,
+            "failed": failed,
+            "legacy_total": legacy_total,
+        },
+        "queue": {
+            "size": pending,
+            "max": MAX_QUEUE_SIZE,
+            "available": max(0, MAX_QUEUE_SIZE - pending),
+            "full": pending >= MAX_QUEUE_SIZE,
         },
         "slots_free": semaphore._value,
         "ts": time.time(),
@@ -470,7 +569,9 @@ async def submit_image(
     req: ImageRequest, bg: BackgroundTasks,
     _=Depends(require_api_key),
 ):
-    tid = await store.create("image")
+    tid = await store.create_if_slot("image")
+    if not tid:
+        raise HTTPException(429, QUEUE_FULL_MSG)
     bg.add_task(_run_image_task, tid, req.image_base64, req.hint)
     return TaskResponse(**await store.get(tid))
 
@@ -482,7 +583,9 @@ async def submit_turnstile(
 ):
     if not req.sitekey or not req.pageurl:
         raise HTTPException(400, "sitekey_and_pageurl_required")
-    tid = await store.create("turnstile")
+    tid = await store.create_if_slot("turnstile")
+    if not tid:
+        raise HTTPException(429, QUEUE_FULL_MSG)
     bg.add_task(
         _run_browser_task,
         tid, req.sitekey, req.pageurl, "turnstile", req.proxy,
@@ -497,7 +600,9 @@ async def submit_recaptcha(
 ):
     if not req.sitekey or not req.pageurl:
         raise HTTPException(400, "sitekey_and_pageurl_required")
-    tid = await store.create("recaptcha")
+    tid = await store.create_if_slot("recaptcha")
+    if not tid:
+        raise HTTPException(429, QUEUE_FULL_MSG)
     bg.add_task(
         _run_browser_task,
         tid, req.sitekey, req.pageurl, "recaptcha", req.proxy,
@@ -621,9 +726,8 @@ async def delete_task(tid: str, _=Depends(require_api_key)):
 # =====================================================================
 # LEGACY /solve
 # =====================================================================
-_legacy_tasks: dict[str, dict[str, Any]] = {}
-_legacy_lock = asyncio.Lock()
-
+# (globals _legacy_tasks dan _legacy_lock dideklarasikan di atas, sebelum
+#  TaskStore, agar bisa dipakai oleh _cleanup_loop)
 
 def _legacy_response(tid: str, task: dict) -> dict:
     status = task.get("status", "pending")
@@ -642,6 +746,15 @@ def _legacy_response(tid: str, task: dict) -> dict:
             "error": task.get("error") or "failed",
         }
     return {"taskId": tid, "status": status}
+
+
+def _legacy_queue_full() -> dict:
+    return {
+        "taskId": None,
+        "status": "error",
+        "error": "queue_full",
+        "message": QUEUE_FULL_MSG,
+    }
 
 
 @app.post("/solve")
@@ -675,6 +788,8 @@ async def legacy_solve(body: dict = Body(...)):
             _legacy_tasks[tid] = {
                 "id": tid, "type": "altcha", "status": "pending",
                 "result": None, "error": None,
+                # NEW: created_at agar _cleanup_loop bisa prune
+                "created_at": time.time(),
             }
         try:
             ch = (
@@ -708,6 +823,8 @@ async def legacy_solve(body: dict = Body(...)):
             _legacy_tasks[tid] = {
                 "id": tid, "type": "friendly", "status": "pending",
                 "result": None, "error": None,
+                # NEW: created_at agar _cleanup_loop bisa prune
+                "created_at": time.time(),
             }
         try:
             ch_b64 = (
@@ -749,7 +866,9 @@ async def legacy_solve(body: dict = Body(...)):
                 "error": "missing_image",
                 "message": "image field required",
             }
-        tid = await store.create("image")
+        tid = await store.create_if_slot("image")
+        if not tid:
+            return _legacy_queue_full()
         asyncio.create_task(
             _run_image_task(tid, image_b64, body.get("hint"))
         )
@@ -771,7 +890,9 @@ async def legacy_solve(body: dict = Body(...)):
                 "error": "missing_params",
                 "message": "siteKey dan domain wajib diisi",
             }
-        tid = await store.create("turnstile")
+        tid = await store.create_if_slot("turnstile")
+        if not tid:
+            return _legacy_queue_full()
         asyncio.create_task(
             _run_browser_task(
                 tid, sitekey, pageurl, "turnstile", body.get("proxy")
@@ -795,7 +916,9 @@ async def legacy_solve(body: dict = Body(...)):
                 "error": "missing_params",
                 "message": "siteKey dan domain wajib diisi",
             }
-        tid = await store.create("recaptcha")
+        tid = await store.create_if_slot("recaptcha")
+        if not tid:
+            return _legacy_queue_full()
         asyncio.create_task(
             _run_browser_task(
                 tid, sitekey, pageurl, "recaptcha", body.get("proxy")
@@ -825,9 +948,9 @@ async def legacy_solve(body: dict = Body(...)):
 async def test_page():
     from fastapi.responses import HTMLResponse
     return HTMLResponse(content=(
-        "<!doctype html><html><head><title>Fortress v4.1</title></head>"
-        "<body><h1>Fortress Captcha v4.1</h1>"
-        "<p>Patchright + Xvfb solver</p>"
+        "<!doctype html><html><head><title>Fortress v4.2</title></head>"
+        "<body><h1>Fortress Captcha v4.2</h1>"
+        "<p>Patchright + Xvfb solver | max queue: 6</p>"
         "<p><a href='/health'>/health</a> | <a href='/'>/</a> | "
         "<a href='/docs'>/docs</a></p>"
         "</body></html>"
