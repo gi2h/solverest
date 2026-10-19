@@ -37,7 +37,7 @@ logging.basicConfig(
 VISION_URL = os.getenv("VISION_URL", "http://vision-solver.railway.internal:9002")
 TASK_TTL = int(os.getenv("TASK_TTL_SECONDS", "3600"))
 DONE_TASK_TTL = int(os.getenv("DONE_TASK_TTL_SECONDS", "600"))
-MAX_CONCURRENT = int(os.getenv("MAX_CONCURRENT_SOLVES", "4"))
+MAX_CONCURRENT = int(os.getenv("MAX_CONCURRENT_SOLVES", "2"))
 MAX_QUEUE_SIZE = int(os.getenv("MAX_QUEUE_SIZE", "10"))
 SOLVE_TIMEOUT = int(os.getenv("SOLVE_TIMEOUT", "180"))
 BROWSER_TIMEOUT = int(os.getenv("BROWSER_TIMEOUT", "90"))
