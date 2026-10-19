@@ -3,7 +3,7 @@ from playwright.async_api import async_playwright
 import urllib.parse
 from typing import Optional
 
-# KONFIGURASI (Sesuaikan dengan milik Anda)
+# KONFIGURASI (Sesuaikan dengan mkilik Anda)
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 HEADLESS = True
 
