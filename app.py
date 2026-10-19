@@ -4,7 +4,7 @@ from typing import Optional
 import uvicorn
 import uuid
 import asyncio
-from turnstile_solver1 import solve_turnstile # Pastikan nama file import sesuai
+from turnstile_solver1 import turnstile_solver # Pastikan nama file import sesuai
 
 app = FastAPI(title="Fortress Captcha API v4.2")
 
