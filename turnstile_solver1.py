@@ -1,5 +1,5 @@
 import asyncio
-from playwright.async_api import async_playwright
+from patchright.async_api import async_playwright
 import urllib.parse
 from typing import Optional
 
