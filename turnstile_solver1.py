@@ -64,10 +64,9 @@ def _launch_args() -> list:
         "--disable-dev-shm-usage",
         "--no-first-run",
         "--no-default-browser-check",
-        "--disable-background-networking",
         "--disable-features=IsolateOrigins,site-per-process",
         "--window-size=1280,800",
-        "--start-maximized",
+    
     ]
 
 
