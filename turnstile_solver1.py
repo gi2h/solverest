@@ -1,9 +1,8 @@
 """
-Turnstile solver — v6 (production fix)
-- Robust iframe detection via frame_element().
-- Forced scroll_into_view before click.
-- Retry click logic (max 3x) with human-like delays.
-- headless=False default (xvfb) untuk render CF yang lebih baik.
+Turnstile solver — v7 (Final)
+- Shadow DOM aware (via page.frames)
+- Single click logic (waits for token, prevents click-spamming)
+- headless=False (xvfb) by default
 """
 from __future__ import annotations
 
@@ -18,18 +17,15 @@ from urllib.parse import urlparse
 log = logging.getLogger("solver")
 logging.basicConfig(level=logging.INFO, format="[solver] %(message)s")
 
-
-USER_AGENTS = [
+USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/131.0.0.0 Safari/537.36",
-]
-USER_AGENT = USER_AGENTS[0]
+    "Chrome/131.0.0.0 Safari/537.36"
+)
 
 STEALTH_JS = """
 Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
 """
-
 
 def _launch_args() -> list:
     return [
@@ -40,14 +36,12 @@ def _launch_args() -> list:
         "--window-size=1366,800",
     ]
 
-
 def _start_xvfb():
     from pyvirtualdisplay import Display
     display = Display(visible=0, size=(1366, 800))
     display.start()
     log.info("xvfb started DISPLAY=%s", os.environ.get("DISPLAY"))
     return display
-
 
 def _parse_cookies(cookies, pageurl: str) -> List[dict]:
     if not cookies:
@@ -74,7 +68,6 @@ def _parse_cookies(cookies, pageurl: str) -> List[dict]:
         out.append({"name": name.strip(), "value": value.strip(), "url": base_url})
     return out
 
-
 async def _new_context(browser, cookies_list=None):
     ctx = await browser.new_context(
         viewport={"width": 1366, "height": 800},
@@ -96,7 +89,6 @@ async def _new_context(browser, cookies_list=None):
             log.warning("add_cookies failed: %s", e)
     return ctx
 
-
 async def _read_token(page, input_name: str = "cf-turnstile-response") -> Optional[str]:
     try:
         return await page.evaluate(
@@ -109,13 +101,10 @@ async def _read_token(page, input_name: str = "cf-turnstile-response") -> Option
     except Exception:
         return None
 
-
 async def _has_cf_widget(page) -> bool:
     try:
         return await page.evaluate("""() => {
             if (document.querySelector('iframe[src*="challenges.cloudflare.com"]')) return true;
-            if (document.querySelector('iframe[src*="turnstile"]')) return true;
-            if (document.querySelector('iframe[id*="cf-chl-widget"]')) return true;
             if (document.querySelector('.cf-turnstile')) return true;
             if (document.querySelector('[data-sitekey]')) return true;
             if (document.querySelector('[name="cf-turnstile-response"]')) return true;
@@ -124,7 +113,6 @@ async def _has_cf_widget(page) -> bool:
         }""")
     except Exception:
         return False
-
 
 async def _page_stats(page) -> dict:
     try:
@@ -147,14 +135,10 @@ async def _page_stats(page) -> dict:
     except Exception as e:
         return {"error": str(e)[:200]}
 
-
 async def _find_turnstile_iframe(page):
     """
-    Deteksi iframe Turnstile dengan dua cara:
-    1. Lewat page.frames -> frame_element() (sangat akurat untuk CF dinamis)
-    2. Fallback query selector (dengan scroll & cek bounding box)
+    Cari iframe dengan menembus Shadow DOM via page.frames.
     """
-    # Cara 1: Lewat daftar frame
     for frame in page.frames:
         if "challenges.cloudflare.com" in (frame.url or ""):
             try:
@@ -168,58 +152,38 @@ async def _find_turnstile_iframe(page):
                         return el
             except Exception:
                 pass
-
-    # Cara 2: Fallback selector
-    selectors = [
-        'iframe[src*="challenges.cloudflare.com"]',
-        'iframe[src*="turnstile"]',
-        'iframe[title*="Widget containing"]',
-        'iframe[id*="cf-chl-widget"]',
-    ]
-    for sel in selectors:
-        try:
-            el = await page.query_selector(sel)
-            if el:
-                await el.scroll_into_view_if_needed()
-                await asyncio.sleep(0.3)
-                box = await el.bounding_box()
-                if box and box["width"] > 10 and box["height"] > 10:
-                    log.info("found iframe via selector: %s", sel)
-                    return el
-        except Exception:
-            continue
     return None
 
-
 async def _click_widget(page, iframe_el) -> bool:
-    """Klik checkbox dengan gerakan mouse natural setelah memastikan terlihat."""
     try:
         await iframe_el.scroll_into_view_if_needed()
         await asyncio.sleep(0.4)
         
         box = await iframe_el.bounding_box()
         if not box:
-            log.warning("click: iframe bounding_box is None (hidden?)")
             return False
             
+        # Jika iframe terlalu besar (misal fullscreen challenge), jangan klik asal
+        if box["width"] > 400 or box["height"] > 200:
+            log.warning("click: iframe terlalu besar (challenge mode?), skip klik.")
+            return False
+
         # Klik di area checkbox (kiri tengah)
         cx = box["x"] + random.uniform(25, 35)
         cy = box["y"] + (box["height"] / 2) + random.uniform(-3, 3)
 
-        # Gerakan mouse manusiawi
+        # Gerakan mouse natural
         await page.mouse.move(cx - 80, cy - 60, steps=random.randint(10, 20))
         await asyncio.sleep(random.uniform(0.15, 0.3))
         await page.mouse.move(cx, cy, steps=random.randint(12, 25))
         await asyncio.sleep(random.uniform(0.1, 0.2))
-        await page.mouse.click(cx, cy)
-        await asyncio.sleep(random.uniform(0.5, 0.8))
         
+        await page.mouse.click(cx, cy)
         log.info("click: success at (%.0f, %.0f)", cx, cy)
         return True
     except Exception as e:
         log.warning("click failed: %s", e)
         return False
-
 
 def _ok(token: str, attempts: int, started: float) -> dict:
     return {
@@ -229,7 +193,6 @@ def _ok(token: str, attempts: int, started: float) -> dict:
         "elapsed_ms": int((time.time() - started) * 1000),
     }
 
-
 def _fail(error: str, started: float, attempts: int = 0) -> dict:
     return {
         "success": False,
@@ -237,7 +200,6 @@ def _fail(error: str, started: float, attempts: int = 0) -> dict:
         "attempts": attempts,
         "elapsed_ms": int((time.time() - started) * 1000),
     }
-
 
 async def solve_turnstile(
     sitekey: str = "",
@@ -261,8 +223,8 @@ async def solve_turnstile(
         return _fail(f"patchright_not_installed: {e}", started)
 
     parsed_cookies = _parse_cookies(cookies, pageurl)
-
     display = None
+    
     if not headless:
         try:
             display = _start_xvfb()
@@ -294,7 +256,6 @@ async def solve_turnstile(
                     return _fail(f"navigation_failed: {e}", started)
 
                 log.info("turnstile: page loaded url=%s", page.url)
-
                 try:
                     await page.wait_for_load_state("networkidle", timeout=8000)
                 except Exception:
@@ -311,26 +272,20 @@ async def solve_turnstile(
                         break
 
                 if not widget_appeared:
-                    stats = await _page_stats(page)
-                    return _fail(
-                        f"turnstile_widget_not_found (url={page.url}, iframes={stats.get('iframeCount', 0)})",
-                        started,
-                    )
+                    return _fail("turnstile_widget_not_found", started)
 
-                # FASE 2: Cek token (auto-pass)
+                # FASE 2: Cek token
                 token = await _read_token(page)
                 if token:
-                    log.info("turnstile: token present early len=%d", len(token))
                     return _ok(token, 0, started)
 
-                # FASE 3: Loop klik & tunggu token
+                # FASE 3: Klik cerdas & Tunggu token
                 deadline = asyncio.get_event_loop().time() + timeout
                 iframe_el = None
                 clicks_done = 0
-                max_clicks = 3
                 attempts = 0
                 last_log = 0
-                next_click_at = 0.0
+                last_click_time = 0.0
 
                 while asyncio.get_event_loop().time() < deadline:
                     attempts += 1
@@ -342,39 +297,28 @@ async def solve_turnstile(
 
                     now = asyncio.get_event_loop().time()
                     
-                    # Logika Klik
-                    if now >= next_click_at:
+                    # Logika Klik: Maksimal 1x klik, tunggu minimal 10 detik sebelum klik lagi jika gagal
+                    if clicks_done < 2 and (now - last_click_time) > 10.0:
                         if iframe_el is None:
                             iframe_el = await _find_turnstile_iframe(page)
                             
-                        if iframe_el is not None and clicks_done < max_clicks:
+                        if iframe_el is not None:
                             if await _click_widget(page, iframe_el):
                                 clicks_done += 1
-                                next_click_at = now + random.uniform(4.0, 6.0)
-                                iframe_el = None # Reset untuk refresh bounding box
-                        else:
-                            next_click_at = now + 2.0
-
+                                last_click_time = now
+                                iframe_el = None # Reset agar fresh
+                    
                     if attempts - last_log >= 10:
                         last_log = attempts
                         s = await _page_stats(page)
                         log.info(
-                            "turnstile attempt %d: iframes=%d cfScript=%s tsGlobal=%s input_len=%d clicks=%d",
-                            attempts,
-                            s.get("iframeCount", 0),
-                            s.get("hasCfScript", False),
-                            s.get("hasTurnstileGlobal", False),
-                            s.get("inputLen", 0),
-                            clicks_done,
+                            "turnstile attempt %d: input_len=%d clicks=%d",
+                            attempts, s.get("inputLen", 0), clicks_done
                         )
 
                     await asyncio.sleep(1)
 
-                stats = await _page_stats(page)
-                return _fail(
-                    f"turnstile_token_timeout (input_len={stats.get('inputLen', 0)}, clicks={clicks_done})",
-                    started, attempts,
-                )
+                return _fail("turnstile_token_timeout", started, attempts)
 
             finally:
                 try:
