@@ -1,21 +1,20 @@
 """
-Turnstile solver — v7 (Final)
-- Shadow DOM aware (via page.frames)
-- Single click logic (waits for token, prevents click-spamming)
-- headless=False (xvfb) by default
+Turnstile + reCAPTCHA solver using Patchright + Xvfb.
+v3.2 - Complete file, WAF interaction, fixed imports.
 """
 from __future__ import annotations
 
 import asyncio
+import base64
 import logging
 import os
-import random
-import time
-from typing import List, Optional, Union
-from urllib.parse import urlparse
+from typing import Optional
 
 log = logging.getLogger("solver")
-logging.basicConfig(level=logging.INFO, format="[solver] %(message)s")
+logging.basicConfig(
+    level=logging.INFO,
+    format="[solver] %(message)s",
+)
 
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -25,71 +24,92 @@ USER_AGENT = (
 
 STEALTH_JS = """
 Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
+Object.defineProperty(navigator, 'plugins', {
+    get: () => [1, 2, 3, 4, 5].map(() => ({
+        name: 'Chrome PDF Plugin',
+        filename: 'internal-pdf-viewer',
+    })),
+});
+window.chrome = { runtime: {}, loadTimes: () => {}, csi: () => {} };
+const originalQuery = window.navigator.permissions.query;
+window.navigator.permissions.query = (parameters) => (
+    parameters.name === 'notifications'
+        ? Promise.resolve({ state: Notification.permission })
+        : originalQuery(parameters)
+);
+Object.defineProperty(navigator, 'hardwareConcurrency', { get: () => 8 });
+Object.defineProperty(navigator, 'deviceMemory', { get: () => 8 });
+const getParameter = WebGLRenderingContext.prototype.getParameter;
+WebGLRenderingContext.prototype.getParameter = function(p) {
+    if (p === 37445) return 'Intel Inc.';
+    if (p === 37446) return 'Intel Iris OpenGL Engine';
+    return getParameter.call(this, p);
+};
 """
+
+PAGE_CLOSE_TIMEOUT = float(os.getenv("PAGE_CLOSE_TIMEOUT", "5"))
+CONTEXT_CLOSE_TIMEOUT = float(os.getenv("CONTEXT_CLOSE_TIMEOUT", "5"))
+BROWSER_CLOSE_TIMEOUT = float(os.getenv("BROWSER_CLOSE_TIMEOUT", "10"))
+
 
 def _launch_args() -> list:
     return [
+        "--disable-blink-features=AutomationControlled",
         "--no-sandbox",
         "--disable-setuid-sandbox",
         "--disable-dev-shm-usage",
-        "--disable-blink-features=AutomationControlled",
-        "--window-size=1366,800",
+        "--no-first-run",
+        "--no-default-browser-check",
+        "--disable-background-networking",
+        "--disable-features=IsolateOrigins,site-per-process",
+        "--window-size=1280,800",
+        "--start-maximized",
     ]
+
 
 def _start_xvfb():
     from pyvirtualdisplay import Display
-    display = Display(visible=0, size=(1366, 800))
+    display = Display(visible=0, size=(1280, 800))
     display.start()
     log.info("xvfb started DISPLAY=%s", os.environ.get("DISPLAY"))
     return display
 
-def _parse_cookies(cookies, pageurl: str) -> List[dict]:
-    if not cookies:
-        return []
-    parsed = urlparse(pageurl)
-    base_url = f"{parsed.scheme}://{parsed.netloc}"
-    if isinstance(cookies, list):
-        out = []
-        for c in cookies:
-            if not isinstance(c, dict) or "name" not in c:
-                continue
-            cc = dict(c)
-            cc.setdefault("value", "")
-            if "url" not in cc and "domain" not in cc:
-                cc["url"] = base_url
-            out.append(cc)
-        return out
-    out = []
-    for part in str(cookies).split(";"):
-        part = part.strip()
-        if not part or "=" not in part:
-            continue
-        name, value = part.split("=", 1)
-        out.append({"name": name.strip(), "value": value.strip(), "url": base_url})
-    return out
 
-async def _new_context(browser, cookies_list=None):
-    ctx = await browser.new_context(
-        viewport={"width": 1366, "height": 800},
+async def _new_context(browser):
+    return await browser.new_context(
+        viewport={"width": 1280, "height": 800},
         user_agent=USER_AGENT,
         locale="en-US",
         timezone_id="America/New_York",
         extra_http_headers={
             "Accept-Language": "en-US,en;q=0.9",
-            "Sec-Ch-Ua": '"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"',
+            "Sec-Ch-Ua": '"Chromium";v="131", "Not_A Brand";v="24"',
             "Sec-Ch-Ua-Mobile": "?0",
             "Sec-Ch-Ua-Platform": '"Windows"',
         },
     )
-    if cookies_list:
-        try:
-            await ctx.add_cookies(cookies_list)
-            log.info("turnstile: added %d cookies to context", len(cookies_list))
-        except Exception as e:
-            log.warning("add_cookies failed: %s", e)
-    return ctx
 
-async def _read_token(page, input_name: str = "cf-turnstile-response") -> Optional[str]:
+
+async def _safe_cleanup(page, context, browser):
+    if page is not None:
+        try:
+            await asyncio.wait_for(page.close(run_before_unload=False), timeout=PAGE_CLOSE_TIMEOUT)
+        except Exception:
+            pass
+    if context is not None:
+        try:
+            await asyncio.wait_for(context.close(), timeout=CONTEXT_CLOSE_TIMEOUT)
+        except Exception:
+            pass
+    if browser is not None:
+        try:
+            await asyncio.wait_for(browser.close(), timeout=BROWSER_CLOSE_TIMEOUT)
+        except Exception:
+            pass
+
+
+async def _read_token(page, input_name: str) -> Optional[str]:
     try:
         return await page.evaluate(
             """(name) => {
@@ -101,130 +121,61 @@ async def _read_token(page, input_name: str = "cf-turnstile-response") -> Option
     except Exception:
         return None
 
-async def _has_cf_widget(page) -> bool:
-    try:
-        return await page.evaluate("""() => {
-            if (document.querySelector('iframe[src*="challenges.cloudflare.com"]')) return true;
-            if (document.querySelector('.cf-turnstile')) return true;
-            if (document.querySelector('[data-sitekey]')) return true;
-            if (document.querySelector('[name="cf-turnstile-response"]')) return true;
-            if (window.turnstile) return true;
-            return false;
-        }""")
-    except Exception:
-        return False
 
-async def _page_stats(page) -> dict:
+async def _is_waf_active(page) -> bool:
     try:
         return await page.evaluate("""
             () => {
+                const title = document.title || "";
+                const body = document.body ? document.body.innerText : "";
+                if (title.includes("Just a moment") || body.includes("Just a moment") || body.includes("Verifying you are human")) {
+                    return true;
+                }
+                if (document.querySelector("#challenge-form") || document.querySelector("#challenge-stage")) {
+                    return true;
+                }
                 const iframes = Array.from(document.querySelectorAll('iframe'));
-                return {
-                    title: document.title,
-                    url: window.location.href,
-                    iframeCount: iframes.length,
-                    hasCfScript: !!document.querySelector('script[src*="challenges.cloudflare.com"]'),
-                    hasTurnstileGlobal: typeof window.turnstile !== 'undefined',
-                    inputLen: (() => {
-                        const el = document.querySelector('[name="cf-turnstile-response"]');
-                        return el ? (el.value || '').length : 0;
-                    })(),
-                };
+                for (let iframe of iframes) {
+                    if (iframe.src && iframe.src.includes('challenges.cloudflare.com')) {
+                        return true;
+                    }
+                }
+                return false;
             }
         """)
-    except Exception as e:
-        return {"error": str(e)[:200]}
-
-async def _find_turnstile_iframe(page):
-    """
-    Cari iframe dengan menembus Shadow DOM via page.frames.
-    """
-    for frame in page.frames:
-        if "challenges.cloudflare.com" in (frame.url or ""):
-            try:
-                el = await frame.frame_element()
-                if el:
-                    await el.scroll_into_view_if_needed()
-                    await asyncio.sleep(0.3)
-                    box = await el.bounding_box()
-                    if box and box["width"] > 10 and box["height"] > 10:
-                        log.info("found iframe via frame_element")
-                        return el
-            except Exception:
-                pass
-    return None
-
-async def _click_widget(page, iframe_el) -> bool:
-    try:
-        await iframe_el.scroll_into_view_if_needed()
-        await asyncio.sleep(0.4)
-        
-        box = await iframe_el.bounding_box()
-        if not box:
-            return False
-            
-        # Jika iframe terlalu besar (misal fullscreen challenge), jangan klik asal
-        if box["width"] > 400 or box["height"] > 200:
-            log.warning("click: iframe terlalu besar (challenge mode?), skip klik.")
-            return False
-
-        # Klik di area checkbox (kiri tengah)
-        cx = box["x"] + random.uniform(25, 35)
-        cy = box["y"] + (box["height"] / 2) + random.uniform(-3, 3)
-
-        # Gerakan mouse natural
-        await page.mouse.move(cx - 80, cy - 60, steps=random.randint(10, 20))
-        await asyncio.sleep(random.uniform(0.15, 0.3))
-        await page.mouse.move(cx, cy, steps=random.randint(12, 25))
-        await asyncio.sleep(random.uniform(0.1, 0.2))
-        
-        await page.mouse.click(cx, cy)
-        log.info("click: success at (%.0f, %.0f)", cx, cy)
-        return True
-    except Exception as e:
-        log.warning("click failed: %s", e)
+    except Exception:
         return False
 
-def _ok(token: str, attempts: int, started: float) -> dict:
-    return {
-        "success": True,
-        "token": token,
-        "attempts": attempts,
-        "elapsed_ms": int((time.time() - started) * 1000),
-    }
 
-def _fail(error: str, started: float, attempts: int = 0) -> dict:
-    return {
-        "success": False,
-        "error": error,
-        "attempts": attempts,
-        "elapsed_ms": int((time.time() - started) * 1000),
-    }
+async def _click_waf_checkbox(page) -> bool:
+    try:
+        iframe_el = await page.query_selector('iframe[src*="challenges.cloudflare.com"]')
+        if iframe_el:
+            box = await iframe_el.bounding_box()
+            if box:
+                cx = box["x"] + (box["width"] / 2)
+                cy = box["y"] + (box["height"] / 2)
+                await page.mouse.click(cx, cy)
+                log.info("WAF: clicked checkbox at (%.0f, %.0f)", cx, cy)
+                return True
+    except Exception:
+        pass
+    return False
+
 
 async def solve_turnstile(
-    sitekey: str = "",
-    pageurl: str = "",
+    sitekey: str,
+    pageurl: str,
     timeout: int = 90,
     proxy: Optional[str] = None,
-    headless: Optional[bool] = None,
-    cookies: Optional[Union[str, List[dict]]] = None,
-    user_agent: Optional[str] = None,
+    headless: bool = False,
 ) -> dict:
-    started = time.time()
-    if not pageurl:
-        return _fail("pageurl_required", started)
-
-    if headless is None:
-        headless = os.environ.get("HEADLESS", "false").lower() == "true"
-
     try:
         from patchright.async_api import async_playwright
     except ImportError as e:
-        return _fail(f"patchright_not_installed: {e}", started)
+        raise RuntimeError(f"patchright_not_installed: {e}")
 
-    parsed_cookies = _parse_cookies(cookies, pageurl)
     display = None
-    
     if not headless:
         try:
             display = _start_xvfb()
@@ -233,113 +184,182 @@ async def solve_turnstile(
             headless = True
 
     try:
-        log.info("turnstile: launching (headless=%s, cookies=%d)", headless, len(parsed_cookies))
-        launch_opts = {
-            "headless": headless,
-            "args": _launch_args(),
-            "chromium_sandbox": False,
-        }
+        launch_opts = {"headless": headless, "args": _launch_args(), "chromium_sandbox": False}
         if proxy:
             launch_opts["proxy"] = {"server": proxy}
 
         async with async_playwright() as p:
             browser = await p.chromium.launch(**launch_opts)
+            context = None
+            page = None
             try:
-                context = await _new_context(browser, cookies_list=parsed_cookies)
+                context = await _new_context(browser)
                 await context.add_init_script(STEALTH_JS)
                 page = await context.new_page()
 
-                log.info("turnstile: navigating to %s", pageurl)
+                log.info("turnstile: navigating to %s (proxy=%s)", pageurl, bool(proxy))
                 try:
                     await page.goto(pageurl, wait_until="domcontentloaded", timeout=30000)
                 except Exception as e:
-                    return _fail(f"navigation_failed: {e}", started)
+                    raise RuntimeError(f"navigation_failed: {e}")
 
-                log.info("turnstile: page loaded url=%s", page.url)
-                try:
-                    await page.wait_for_load_state("networkidle", timeout=8000)
-                except Exception:
-                    pass
-                await asyncio.sleep(2)
+                await asyncio.sleep(3)
 
-                # FASE 1: Tunggu widget muncul
-                widget_appeared = False
-                for i in range(20):
-                    await asyncio.sleep(1)
-                    if await _has_cf_widget(page):
-                        widget_appeared = True
-                        log.info("turnstile: widget detected after %ds", i + 1)
-                        break
+                # WAF CHECK & CLICK
+                waf_attempts = 0
+                while await _is_waf_active(page):
+                    waf_attempts += 1
+                    if waf_attempts > 8: 
+                        raise RuntimeError("waf_bypass_timeout (Cloudflare blocked datacenter IP. Provide a proxy.)")
+                    
+                    log.info("turnstile: WAF detected, trying to interact... (%d/8)", waf_attempts)
+                    await _click_waf_checkbox(page)
+                    await asyncio.sleep(4)
 
-                if not widget_appeared:
-                    return _fail("turnstile_widget_not_found", started)
+                log.info("turnstile: WAF cleared or not present.")
 
-                # FASE 2: Cek token
-                token = await _read_token(page)
+                # TOKEN CHECK
+                token = await _read_token(page, "cf-turnstile-response")
                 if token:
-                    return _ok(token, 0, started)
+                    cookies = await context.cookies()
+                    cookie_dict = {c["name"]: c["value"] for c in cookies}
+                    log.info("turnstile: token early len=%d, cookies=%s", len(token), list(cookie_dict.keys()))
+                    return {"token": token, "cookies": cookie_dict, "user_agent": USER_AGENT}
 
-                # FASE 3: Klik cerdas & Tunggu token
                 deadline = asyncio.get_event_loop().time() + timeout
-                iframe_el = None
-                clicks_done = 0
-                attempts = 0
-                last_log = 0
-                last_click_time = 0.0
-
                 while asyncio.get_event_loop().time() < deadline:
-                    attempts += 1
-
-                    token = await _read_token(page)
+                    token = await _read_token(page, "cf-turnstile-response")
                     if token:
-                        log.info("turnstile: token acquired len=%d at attempt %d", len(token), attempts)
-                        return _ok(token, attempts, started)
-
-                    now = asyncio.get_event_loop().time()
-                    
-                    # Logika Klik: Maksimal 1x klik, tunggu minimal 10 detik sebelum klik lagi jika gagal
-                    if clicks_done < 2 and (now - last_click_time) > 10.0:
-                        if iframe_el is None:
-                            iframe_el = await _find_turnstile_iframe(page)
-                            
-                        if iframe_el is not None:
-                            if await _click_widget(page, iframe_el):
-                                clicks_done += 1
-                                last_click_time = now
-                                iframe_el = None # Reset agar fresh
-                    
-                    if attempts - last_log >= 10:
-                        last_log = attempts
-                        s = await _page_stats(page)
-                        log.info(
-                            "turnstile attempt %d: input_len=%d clicks=%d",
-                            attempts, s.get("inputLen", 0), clicks_done
-                        )
-
+                        cookies = await context.cookies()
+                        cookie_dict = {c["name"]: c["value"] for c in cookies}
+                        log.info("turnstile: token acquired len=%d, cookies=%s", len(token), list(cookie_dict.keys()))
+                        return {"token": token, "cookies": cookie_dict, "user_agent": USER_AGENT}
                     await asyncio.sleep(1)
 
-                return _fail("turnstile_token_timeout", started, attempts)
+                raise RuntimeError("turnstile_token_timeout")
 
             finally:
-                try:
-                    await page.close()
-                except Exception:
-                    pass
-                try:
-                    await context.close()
-                except Exception:
-                    pass
-                try:
-                    await browser.close()
-                except Exception:
-                    pass
-
-    except Exception as e:
-        log.exception("turnstile: unexpected error")
-        return _fail(f"unexpected: {type(e).__name__}: {e}", started)
+                await _safe_cleanup(page, context, browser)
     finally:
         if display:
+            try: display.stop()
+            except Exception: pass
+
+
+async def solve_recaptcha(
+    sitekey: str,
+    pageurl: str,
+    timeout: int = 90,
+    proxy: Optional[str] = None,
+    headless: bool = False,
+) -> dict:
+    try:
+        from patchright.async_api import async_playwright
+    except ImportError as e:
+        raise RuntimeError(f"patchright_not_installed: {e}")
+
+    display = None
+    if not headless:
+        try:
+            display = _start_xvfb()
+        except Exception as e:
+            log.warning("xvfb failed: %s", e)
+            headless = True
+
+    try:
+        launch_opts = {"headless": headless, "args": _launch_args(), "chromium_sandbox": False}
+        if proxy:
+            launch_opts["proxy"] = {"server": proxy}
+
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(**launch_opts)
+            context = None
+            page = None
             try:
-                display.stop()
-            except Exception:
-                pass
+                context = await _new_context(browser)
+                await context.add_init_script(STEALTH_JS)
+                page = await context.new_page()
+
+                await page.goto(pageurl, wait_until="domcontentloaded", timeout=30000)
+                await asyncio.sleep(3)
+
+                deadline = asyncio.get_event_loop().time() + timeout
+                while asyncio.get_event_loop().time() < deadline:
+                    token = await _read_token(page, "g-recaptcha-response")
+                    if token:
+                        cookies = await context.cookies()
+                        cookie_dict = {c["name"]: c["value"] for c in cookies}
+                        return {"token": token, "cookies": cookie_dict, "user_agent": USER_AGENT}
+                    await asyncio.sleep(1)
+
+                raise RuntimeError("recaptcha_token_timeout")
+
+            finally:
+                await _safe_cleanup(page, context, browser)
+    finally:
+        if display:
+            try: display.stop()
+            except Exception: pass
+
+
+async def get_cloudflare_cookie(
+    url: str,
+    timeout: int = 60,
+    proxy: Optional[str] = None,
+    headless: bool = False,
+) -> dict:
+    try:
+        from patchright.async_api import async_playwright
+    except ImportError as e:
+        raise RuntimeError(f"patchright_not_installed: {e}")
+
+    display = None
+    if not headless:
+        try:
+            display = _start_xvfb()
+        except Exception as e:
+            log.warning("xvfb failed: %s", e)
+            headless = True
+
+    try:
+        launch_opts = {"headless": headless, "args": _launch_args(), "chromium_sandbox": False}
+        if proxy:
+            launch_opts["proxy"] = {"server": proxy}
+
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(**launch_opts)
+            context = None
+            page = None
+            try:
+                context = await _new_context(browser)
+                await context.add_init_script(STEALTH_JS)
+                page = await context.new_page()
+
+                await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+                await asyncio.sleep(3)
+
+                deadline = asyncio.get_event_loop().time() + timeout
+                while asyncio.get_event_loop().time() < deadline:
+                    cookies = await context.cookies()
+                    names = {c["name"] for c in cookies}
+                    if "cf_clearance" in names:
+                        break
+                    await asyncio.sleep(1)
+
+                cookies = await context.cookies()
+                cookie_dict = {c["name"]: c["value"] for c in cookies}
+                html = await page.content()
+
+                return {
+                    "cookies": cookie_dict,
+                    "user_agent": USER_AGENT,
+                    "html": html,
+                    "final_url": page.url,
+                }
+
+            finally:
+                await _safe_cleanup(page, context, browser)
+    finally:
+        if display:
+            try: display.stop()
+            except Exception: pass
