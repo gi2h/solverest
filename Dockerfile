@@ -28,8 +28,8 @@ RUN npm install
 COPY . .
 
 # Port default (sesuai app.js)
-EXPOSE 7860
-ENV PORT=7860
+EXPOSE 8080
+ENV PORT=8080
 
 # Jalankan Node.js
 CMD ["node", "app.js"]
