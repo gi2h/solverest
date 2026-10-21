@@ -1,229 +1,91 @@
-// app.js
-const express = require("express");
-const { connect } = require("puppeteer-real-browser");
-const crypto = require('crypto');
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+import asyncio
+import os
+import uuid
+import time
+from typing import Optional, Dict
+from fastapi import FastAPI, HTTPException, Request, BackgroundTasks
+from pydantic import BaseModel
+import uvicorn
 
-const turnstile = require("./turnstile");
-const interstitial = require("./interstitial");
+from turnstile_solver1 import solve_turnstile, solve_recaptcha, get_cloudflare_cookie
 
-const app = express();
-const port = process.env.PORT || 7860;
+app = FastAPI(title="Fortress Captcha Solver")
 
-app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
+# Task Store
+class TaskResult(BaseModel):
+    id: str
+    status: str          # pending | done | failed
+    result: Optional[str] = None
+    error: Optional[str] = None
+    created_at: float
+    updated_at: float
+    proxy_used: Optional[str] = None
 
-// ── LIMIT & CLEANER CONFIG ──
-const MAX_ACTIVE = Number(process.env.MAX_ACTIVE || 5); // Batasi 5 browser paralel
-const MAX_CONTEXTS = 20; // Rotasi browser setelah 20 context
-const TASK_TTL_MS = 2 * 60 * 1000; // Hapus task setelah 2 menit
+TASKS: Dict[str, TaskResult] = {}
+TASKS_LOCK = asyncio.Lock()
 
-let activeTasks = 0;
-const tasks = {};
+async def _task_create(proxy_used: Optional[str]) -> str:
+    tid = str(uuid.uuid4())
+    async with TASKS_LOCK:
+        TASKS[tid] = TaskResult(
+            id=tid, status="pending", created_at=time.time(),
+            updated_at=time.time(), proxy_used=proxy_used,
+        )
+    return tid
 
-let browser;
-let browserStarting;
-let contextCounter = 0;
-let isResetting = false;
+async def _task_update(tid: str, status: str, result: Optional[str] = None, error: Optional[str] = None) -> None:
+    async with TASKS_LOCK:
+        t = TASKS.get(tid)
+        if t:
+            t.status = status
+            t.result = result
+            t.error = error
+            t.updated_at = time.time()
 
-// CLEANER: Hapus task lama dari memori setiap 1 menit
-setInterval(() => {
-    const now = Date.now();
-    for (const [id, task] of Object.entries(tasks)) {
-        if (task.createdAt && (now - task.createdAt > TASK_TTL_MS)) {
-            delete tasks[id];
-            console.log(`[CLEANER] Task ${id} expired and removed.`);
-        }
-    }
-}, 60000);
+class SolveReq(BaseModel):
+    sitekey: str
+    pageurl: str
+    proxy: Optional[str] = None
+    kind: str = "turnstile"
 
-async function init_browser(proxyObj) {
-    console.log('[BROWSER] init_browser called');
+async def _run_task(tid: str, sitekey: str, pageurl: str, proxy: Optional[str], kind: str) -> None:
+    try:
+        if kind == "recaptcha":
+            tok = await solve_recaptcha(sitekey, pageurl, proxy)
+        else:
+            tok = await solve_turnstile(sitekey, pageurl, proxy)
 
-    if (!browser || !browser.isConnected()) {
-        browser = null;
-        if (!browserStarting) {
-            console.log("--- [BROWSER] Instance started ---");
-            browserStarting = connect({
-                headless: false, 
-                turnstile: true,
-                connectOption: {
-                    defaultViewport: null,
-                    protocolTimeout: 120000 
-                },
-                disableXvfb: true, 
-                args: [
-                    "--no-sandbox",
-                    "--display=:99",
-                    "--disable-gpu",
-                    "--disable-dev-shm-usage",
-                    "--disable-setuid-sandbox"
-                ],
-            }).then(ctx => {
-                browser = ctx.browser;
-                console.log('[BROWSER] Browser connected');
-                browser.on('disconnected', () => {
-                    console.log('[BROWSER] Browser disconnected');
-                    browser = null;
-                    browserStarting = null; 
-                });
-                return browser;
-            }).catch(err => {
-                console.error("[BROWSER] Launch error:", err.message);
-                browserStarting = null;
-                throw { usr: "ERROR_CAPTCHA_UNSOLVABLE", api: `launch error: ${err.message}` };
-            });
-        }
-        await browserStarting;
-    }
+        if tok:
+            await _task_update(tid, "done", result=tok)
+        else:
+            await _task_update(tid, "failed", error=f"navigation_failed or timeout on {pageurl}")
+    except Exception as e:
+        await _task_update(tid, "failed", error=str(e)[:200])
 
-    try {
-        console.log('[BROWSER] Creating context with proxy:', proxyObj?.server || 'none');
-        const contextOptions = proxyObj?.server ? { proxyServer: proxyObj.server } : {};
-        const context = await browser.createBrowserContext(contextOptions);
-        const page = await context.newPage();
-        
-        if (proxyObj?.username) {
-            await page.authenticate({ username: proxyObj.username, password: proxyObj.password });
-        }
-        
-        page.setDefaultNavigationTimeout(60000);
-        return { page, context }; 
-    } catch (err) {
-        console.error('[BROWSER] Context error:', err.message);
-        throw { usr: "ERROR_CAPTCHA_UNSOLVABLE", api: `ctx error: ${err.message}` };
-    }
-}
+@app.get("/health")
+async def health():
+    return {"ok": True, "version": "4.1.0", "solver": "patchright", "tasks": len(TASKS)}
 
-async function reset_browser() {
-    if (isResetting) return;
-    isResetting = true;
-    browserStarting = null; 
-    if (browser) {
-        await browser.close().catch(() => {});
-        browser = null;
-    }
-    contextCounter = 0;
-    console.log("--- [BROWSER] Instance closed & rotated ---");
-    isResetting = false;
-}
+@app.post("/v1/solve/turnstile")
+async def submit_turnstile(req: SolveReq, bg: BackgroundTasks):
+    tid = await _task_create(req.proxy)
+    bg.add_task(_run_task, tid, req.sitekey, req.pageurl, req.proxy, req.kind)
+    return {"id": tid}
 
-// ── ROUTER ──
-app.get("/", (req, res) => {
-    res.status(200).json({ status: "ok", message: "ready", uptime: `${Math.floor(process.uptime())}s`, active: activeTasks });
-});
+@app.get("/v1/tasks/{tid}/wait")
+async def task_wait(tid: str, timeout: int = 60):
+    deadline = time.time() + max(1, min(timeout, 180))
+    while time.time() < deadline:
+        async with TASKS_LOCK:
+            t = TASKS.get(tid)
+        if not t:
+            raise HTTPException(status_code=404, detail="unknown task")
+        if t.status in ("done", "failed"):
+            return {"status": t.status, "result": t.result, "error": t.error}
+        await asyncio.sleep(0.5)
+    return {"status": "pending", "result": None, "error": None}
 
-app.post("/solve", async (req, res) => {
-    const body = req.body;
-    const reqTaskId = body.taskId;
-
-    // 1. Jika client mengirim taskId, balas dengan status task tersebut
-    if (reqTaskId) {
-        const existingTask = tasks[reqTaskId];
-        if (!existingTask) {
-            return res.status(200).json({
-                status: "error",
-                taskId: reqTaskId,
-                err: { usr: "TASK_NOT_FOUND", api: "Task ID invalid or expired.", msg: "Task expired." }
-            });
-        }
-        return res.status(200).json(existingTask);
-    }
-
-    // 2. Validasi Request Baru
-    if (body.method !== "CloudflareTask" || typeof body.task !== "object") {
-        return res.status(400).json({ status: "error", err: { usr: "BAD_PARAMETERS", api: "Invalid method.", msg: "Provide valid params." } });
-    }
-
-    const task = body.task;
-    const method = (task.type || "").toLowerCase();
-    const domain = task.websiteUrl;
-    const siteKey = task.websiteKey;
-
-    if (method !== "turnstile" && method !== "interstitial") {
-        return res.status(400).json({ status: "error", err: { usr: "BAD_PARAMETERS", api: "Type not supported.", msg: "Turnstile/Interstitial only." } });
-    }
-
-    // 3. Batas Browser
-    if (activeTasks >= MAX_ACTIVE) {
-        return res.status(429).json({
-            status: "error",
-            err: { usr: "TOO_MANY_REQUESTS", api: "Server overload.", msg: "Max active capacity reached." }
-        });
-    }
-
-    // 4. Proses Task
-    const newTaskId = crypto.randomUUID().replace(/-/g, '').slice(0, 12);
-    activeTasks++;
-    tasks[newTaskId] = { status: "processing", taskId: newTaskId, createdAt: Date.now() };
-    
-    res.status(202).json({ taskId: newTaskId, status: "pending" });
-        
-    (async () => {
-        let ctx;     
-        try {
-            if (contextCounter >= MAX_CONTEXTS) await reset_browser();
-
-            ctx = await init_browser(task.proxy || null);
-            contextCounter++;
-
-            let result;
-            if (method === "turnstile") {
-                // Memanggil turnstile.js (Injection)
-                result = await turnstile({ domain, siteKey }, ctx.page);
-            } else {
-                result = await interstitial({ domain, payload: task.payload || null }, ctx.page); 
-            }
-
-            const solution = {};
-            if (method === "turnstile") {
-                solution.token = result.token;
-            } else {
-                solution.cf_clearance = result.solution?.clearance || "";
-                solution.user_agent = result.solution?.user_agent || "";
-            }
-
-            tasks[newTaskId] = { 
-                status: "ready", 
-                taskId: newTaskId,
-                solution: solution,
-                createdAt: Date.now()
-            };
-
-        } catch (err) {
-            console.error(`[Task ${newTaskId}] Solver error:`, err);
-            tasks[newTaskId] = {
-                status: "error",
-                taskId: newTaskId,
-                err: { usr: err.usr || "ERROR_CAPTCHA_UNSOLVABLE", api: err.api || err.message || String(err) } 
-            };
-        } finally {
-            activeTasks--;
-            setTimeout(async () => {
-                try {
-                    if (ctx) {
-                        if (ctx.page) await ctx.page.close().catch(() => {});
-                        if (ctx.context) await ctx.context.close().catch(() => {});
-                    }
-                } catch (err) { /* ignore */ }
-            }, 5000); // Beri waktu 5 detik sebelum context dihancurkan
-        }
-    })();
-});
-
-// ── GLOBAL ERROR HANDLER ──
-app.use((err, req, res, next) => {
-    console.error(err.stack);
-    res.status(500).json({ status: "error", err: { usr: "INTERNAL_SERVER_ERROR", api: err.message } });
-});
-
-app.listen(port, '0.0.0.0', () => {
-    console.log(`Server running: http://0.0.0.0:${port}`);
-});
-
-const cleanup = async (code) => {
-    if (browser) await browser.close().catch(() => {});
-    process.exit(code);
-};
-
-process.on("SIGINT", () => cleanup(1));
-process.on("SIGTERM", () => cleanup(9));
+if __name__ == "__main__":
+    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", "8080")))
