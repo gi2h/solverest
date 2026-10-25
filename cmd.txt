@@ -1,0 +1,5 @@
+
+sudo docker rm -f cft-js && sudo docker rmi -f cft-js
+
+sudo docker build -t cft-js .
+sudo docker run -d --name cft-js -p 4262:4262 -e PORT=4262 cft-js

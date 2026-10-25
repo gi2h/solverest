@@ -1,35 +1,22 @@
 FROM node:20-slim
 
-# Install dependensi Linux untuk menjalankan Chrome/Puppeteer
 RUN apt-get update && apt-get install -y \
-    wget \
-    gnupg \
-    ca-certificates \
-    xvfb \
-    libnss3 \
-    libatk-bridge2.0-0 \
-    libcups2 \
-    libxkbcommon0 \
-    libxcomposite1 \
-    libxdamage1 \
-    libxfixes3 \
-    libxrandr2 \
-    libgbm1 \
-    libasound2 \
+    wget gnupg ca-certificates xvfb \
+    fonts-liberation libappindicator3-1 libasound2 libatk-bridge2.0-0 \
+    libatk1.0-0 libxss1 libnss3 libxcomposite1 libxdamage1 libxrandr2 libgbm1 \
+    && wget https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb \
+    && apt-get install -y ./google-chrome-stable_current_amd64.deb \
+    && rm google-chrome-stable_current_amd64.deb \
     && rm -rf /var/lib/apt/lists/*
 
-WORKDIR /solver
+WORKDIR /A
 
-# Copy package.json dan install dependencies
 COPY package*.json ./
-RUN npm install
 
-# Copy semua file source code
+RUN npm ci --omit=dev
+
 COPY . .
 
-# Port default (sesuai app.js)
-EXPOSE 8080
-ENV PORT=8080
+EXPOSE 7860
 
-# Jalankan Node.js
-CMD ["node", "app.js"]
+CMD ["sh", "-c", "rm -f /tmp/.X99-lock && Xvfb :99 -screen 0 1024x768x24 & export DISPLAY=:99 && exec npm start"]

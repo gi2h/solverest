@@ -1,0 +1,19 @@
+{
+    "name": "cloudflare",
+    "version": "7.3.0",
+    "description": "gmxch_Api",
+    "main": "app.js",
+    "scripts": {
+        "start": "node app.js",
+        "dev": "nodemon app.js"
+    },
+    "dependencies": {
+        "axios": "^1.7.9",
+        "express": "^4.19.2",
+        "puppeteer-real-browser": "1.4.0"
+    },
+    "devDependencies": {
+        "nodemon": "^3.1.10"
+    },
+    "license": "MIT"
+}

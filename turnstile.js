@@ -1,21 +1,18 @@
 /**
- * API_TURNSTILE (v2 - Dynamic & Robust)
+ * API_TURNSTILE
  */
 async function turnstile({ domain, siteKey, action, cdata, pagedata }, page) {
-    // Naikkan timeout karena Cloudflare kadang butuh waktu render
-    const timeout = 30000;
+    const timeout = 20000;
 
     try {
         await page.setDefaultNavigationTimeout(timeout);
 
-        // Injeksi HTML dengan error-callback agar kita tahu jika sitekey ditolak
         const htmlContent = `
             <!DOCTYPE html>
             <html lang="en">
-            <head><meta charset="utf-8"></head>
-            <body style="background:#fff; display:flex; justify-content:center; align-items:center; height:100vh;">
+            <body>
                 <div class="turnstile"></div>
-                <script src="https://challenges.cloudflare.com/turnstile/v0/api.js?onload=onloadTurnstileCallback" async defer></script>
+                <script src="https://challenges.cloudflare.com/turnstile/v0/api.js?onload=onloadTurnstileCallback" defer></script>
                 <script>
                     window.onloadTurnstileCallback = function () {
                         turnstile.render('.turnstile', {
@@ -29,14 +26,6 @@ async function turnstile({ domain, siteKey, action, cdata, pagedata }, page) {
                                 c.name = 'cf-response';
                                 c.value = token;
                                 document.body.appendChild(c);
-                            },
-                            'error-callback': function (err) {
-                                // Tangkap error dari Cloudflare
-                                var c = document.createElement('input');
-                                c.type = 'hidden';
-                                c.name = 'cf-error';
-                                c.value = String(err);
-                                document.body.appendChild(c);
                             }
                         });
                     };
@@ -47,13 +36,12 @@ async function turnstile({ domain, siteKey, action, cdata, pagedata }, page) {
 
         await page.setRequestInterception(true);
         page.removeAllListeners("request");
-        
         page.on("request", async (request) => {
             try {
-                // Cek jika URL yang diminta persis sama dengan domain target
-                const isTarget = request.url() === domain || request.url() === domain + "/";
-                
-                if (isTarget && request.resourceType() === "document") {
+                if (
+                    [domain, domain + "/"].includes(request.url()) &&
+                    request.resourceType() === "document"
+                ) {
                     await request.respond({
                         status: 200,
                         contentType: "text/html",
@@ -62,37 +50,24 @@ async function turnstile({ domain, siteKey, action, cdata, pagedata }, page) {
                 } else {
                     await request.continue();
                 }
-            } catch (e) {
-                // Abaikan error jika request sudah dibatalkan
-            }
+            } catch {}
         });
 
-        // Buka domain (ini akan memicu request interception di atas)
         await page.goto(domain, { waitUntil: "domcontentloaded" });
 
-        // Tunggu sampai token muncul ATAU error muncul
-        await page.waitForSelector('[name="cf-response"], [name="cf-error"]', { timeout });
+        await page.waitForSelector('[name="cf-response"]', { timeout });
 
-        // Ambil hasilnya
-        const result = await page.evaluate(() => {
-            const tokenEl = document.querySelector('[name="cf-response"]');
-            const errorEl = document.querySelector('[name="cf-error"]');
-            
-            if (tokenEl && tokenEl.value) return { token: tokenEl.value };
-            if (errorEl && errorEl.value) return { error: errorEl.value };
-            return null;
+        const token = await page.evaluate(() => {
+            const el = document.querySelector('[name="cf-response"]');
+            return el ? el.value : null;
         });
 
-        if (result && result.error) {
-            throw new Error(`CF Error: ${result.error}`);
-        }
-
-        if (!result || !result.token || result.token.length < 10) {
-            throw new Error("Token tidak valid atau kosong");
+        if (!token || token.length < 10) {
+            throw new Error("totally failed");
         }
 
         return {
-            token: result.token,
+            token,
             type: "turnstile"
         };
 

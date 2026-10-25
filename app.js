@@ -1,9 +1,13 @@
 // app.js
+
 const express = require("express");
 const { connect } = require("puppeteer-real-browser");
 const crypto = require('crypto');
 
+// Ubah dari "./Api/turnstile" menjadi "./turnstile"
 const turnstile = require("./turnstile");
+
+// Ubah dari "./Api/interstitial" menjadi "./interstitial"
 const interstitial = require("./interstitial");
 
 const app = express();
@@ -12,29 +16,16 @@ const port = process.env.PORT || 7860;
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-// ── LIMIT & CLEANER CONFIG ──
-const MAX_ACTIVE = Number(process.env.MAX_ACTIVE || 5); // Batasi 5 browser paralel
-const MAX_CONTEXTS = 20; // Rotasi browser setelah 20 context
-const TASK_TTL_MS = 2 * 60 * 1000; // Hapus task setelah 2 menit
-
+// Concurrency
+const MAX_ACTIVE = Number(process.env.MAX_ACTIVE || 10);
 let activeTasks = 0;
 const tasks = {};
 
 let browser;
 let browserStarting;
 let contextCounter = 0;
+const MAX_CONTEXTS = 25;
 let isResetting = false;
-
-// CLEANER: Hapus task lama dari memori setiap 1 menit
-setInterval(() => {
-    const now = Date.now();
-    for (const [id, task] of Object.entries(tasks)) {
-        if (task.createdAt && (now - task.createdAt > TASK_TTL_MS)) {
-            delete tasks[id];
-            console.log(`[CLEANER] Task ${id} expired and removed.`);
-        }
-    }
-}, 60000);
 
 async function init_browser(proxyObj) {
     console.log('[BROWSER] init_browser called');
@@ -70,7 +61,10 @@ async function init_browser(proxyObj) {
             }).catch(err => {
                 console.error("[BROWSER] Launch error:", err.message);
                 browserStarting = null;
-                throw { usr: "ERROR_CAPTCHA_UNSOLVABLE", api: `launch error: ${err.message}` };
+                throw {
+                    usr: "ERROR_CAPTCHA_UNSOLVABLE",
+                    api: `launch error: ${err.message}` 
+                };
             });
         }
         await browserStarting;
@@ -80,17 +74,29 @@ async function init_browser(proxyObj) {
         console.log('[BROWSER] Creating context with proxy:', proxyObj?.server || 'none');
         const contextOptions = proxyObj?.server ? { proxyServer: proxyObj.server } : {};
         const context = await browser.createBrowserContext(contextOptions);
+        console.log('[BROWSER] Context created');
+        
         const page = await context.newPage();
+        console.log('[BROWSER] Page created');
         
         if (proxyObj?.username) {
-            await page.authenticate({ username: proxyObj.username, password: proxyObj.password });
+            console.log('[BROWSER] Setting proxy authentication...');
+            await page.authenticate({ 
+                username: proxyObj.username, 
+                password: proxyObj.password 
+            });
+            console.log('[BROWSER] Proxy auth set');
         }
         
         page.setDefaultNavigationTimeout(60000);
         return { page, context }; 
     } catch (err) {
         console.error('[BROWSER] Context error:', err.message);
-        throw { usr: "ERROR_CAPTCHA_UNSOLVABLE", api: `ctx error: ${err.message}` };
+        console.error('[BROWSER] Stack:', err.stack);
+        throw {
+            usr: "ERROR_CAPTCHA_UNSOLVABLE",
+            api: `ctx error: ${err.message}` 
+        };
     }
 }
 
@@ -107,113 +113,243 @@ async function reset_browser() {
     isResetting = false;
 }
 
-// ── ROUTER ──
+// Router
 app.get("/", (req, res) => {
-    res.status(200).json({ status: "ok", message: "ready", uptime: `${Math.floor(process.uptime())}s`, active: activeTasks });
+    const uptime = process.uptime();
+    res.status(200).json({
+        status: "ok",
+        message: "ready",
+        uptime: `${Math.floor(uptime)}s`
+    });
 });
 
 app.post("/solve", async (req, res) => {
     const body = req.body;
     const reqTaskId = body.taskId;
 
-    // 1. Jika client mengirim taskId, balas dengan status task tersebut
     if (reqTaskId) {
         const existingTask = tasks[reqTaskId];
         if (!existingTask) {
             return res.status(200).json({
                 status: "error",
                 taskId: reqTaskId,
-                err: { usr: "TASK_NOT_FOUND", api: "Task ID invalid or expired.", msg: "Task expired." }
+                err: {
+                    usr: "TASK_NOT_FOUND",
+                    api: "Requested taskId does not exist in memory.",
+                    msg: "The task ID you provided is invalid or has expired."
+                }
             });
         }
         return res.status(200).json(existingTask);
     }
 
-    // 2. Validasi Request Baru
     if (body.method !== "CloudflareTask" || typeof body.task !== "object") {
-        return res.status(400).json({ status: "error", err: { usr: "BAD_PARAMETERS", api: "Invalid method.", msg: "Provide valid params." } });
-    }
-
-    const task = body.task;
-    const method = (task.type || "").toLowerCase();
-    const domain = task.websiteUrl;
-    const siteKey = task.websiteKey;
-
-    if (method !== "turnstile" && method !== "interstitial") {
-        return res.status(400).json({ status: "error", err: { usr: "BAD_PARAMETERS", api: "Type not supported.", msg: "Turnstile/Interstitial only." } });
-    }
-
-    // 3. Batas Browser
-    if (activeTasks >= MAX_ACTIVE) {
-        return res.status(429).json({
+        return res.status(400).json({
             status: "error",
-            err: { usr: "TOO_MANY_REQUESTS", api: "Server overload.", msg: "Max active capacity reached." }
+            err: {
+                usr: "BAD_PARAMETERS",
+                api: "Root parameter 'method' must be 'CloudflareTask' and 'task' must be an object.",
+                msg: "Please provide valid parameters."
+            }
         });
     }
 
-    // 4. Proses Task
+    const task = body.task;
+
+    const method = (task.type || "").toLowerCase();
+    const domain = task.websiteUrl;
+    const siteKey = task.websiteKey;
+    const action = task.action;
+    const cdata = task.cdata;
+    const pagedata = task.pdata || task.pagedata;
+    const payload = task.payload || null;
+    const rawProxy = task.proxy;
+
+    if (method !== "turnstile" && method !== "interstitial") {
+        return res.status(400).json({
+            status: "error",
+            err: {
+                usr: "BAD_PARAMETERS",
+                api: "Task parameter 'type' is missing or not supported. Supported: turnstile, interstitial",
+                msg: "Please provide valid parameters."
+            }
+        });
+    }
+
+    if (method === "turnstile" && (!domain || !siteKey)) {
+        return res.status(400).json({
+            status: "error",
+            err: {
+                usr: "BAD_PARAMETERS",
+                api: "Method 'turnstile' requires both 'websiteUrl' and 'websiteKey'.",
+                msg: "Please provide valid parameters."
+            }
+        });
+    }
+
+    if (method === "interstitial" && !domain) {
+        return res.status(400).json({
+            status: "error",
+            err: {
+                usr: "BAD_PARAMETERS",
+                api: "Method 'interstitial' requires parameter 'websiteUrl'.",
+                msg: "Please provide valid parameters."
+            }
+        });
+    }
+
+    try {
+        const checkUrl = new URL(domain);
+        if (!['http:', 'https:'].includes(checkUrl.protocol)) {
+            throw new Error("Protocol must be http:// or https://");
+        }
+    } catch (e) {
+        return res.status(400).json({
+            status: "error",
+            err: { 
+                usr: "BAD_PARAMETERS", 
+                api: `Invalid 'websiteUrl': ${e.message}`,
+                msg: "Please provide a valid URL."
+            }
+        });
+    }
+
+    if (activeTasks >= MAX_ACTIVE) {
+        return res.status(429).json({
+            status: "error",
+            err: {
+                usr: "TOO_MANY_REQUESTS",
+                api: "Server cluster overload, max active capacity reached.",
+                msg: "Too many requests, please wait a moment."
+            }
+        });
+    }
+
+    let proxyObj = null;
+    if (rawProxy) {
+        try {
+            if (typeof rawProxy === 'object' && rawProxy.host && rawProxy.port) {
+                const pType = rawProxy.type || 'http';
+                const auth = (rawProxy.user && rawProxy.pass) ? `${rawProxy.user}:${rawProxy.pass}@` : "";
+                const proxyString = `${pType}://${auth}${rawProxy.host}:${rawProxy.port}`;
+                const u = new URL(proxyString);
+                proxyObj = { 
+                    server: `${u.protocol}//${u.host}`, 
+                    username: u.username, 
+                    password: u.password 
+                };
+            } else if (typeof rawProxy === 'string') {
+                const u = new URL(rawProxy);
+                proxyObj = { 
+                    server: `${u.protocol}//${u.host}`, 
+                    username: u.username, 
+                    password: u.password 
+                };
+            }
+        } catch (e) {
+            return res.status(400).json({
+                status: "error",
+                err: { 
+                    usr: "BAD_PARAMETERS", 
+                    api: `Proxy parse error: ${e.message}`, 
+                    msg: "Invalid proxy configuration." 
+                }
+            });
+        }
+    }
+
     const newTaskId = crypto.randomUUID().replace(/-/g, '').slice(0, 12);
     activeTasks++;
-    tasks[newTaskId] = { status: "processing", taskId: newTaskId, createdAt: Date.now() };
+    tasks[newTaskId] = { status: "processing", taskId: newTaskId };
     
-    res.status(202).json({ taskId: newTaskId, status: "pending" });
+    res.status(202).json({
+        taskId: newTaskId,
+        status: "pending" 
+    });
         
     (async () => {
         let ctx;     
         try {
-            if (contextCounter >= MAX_CONTEXTS) await reset_browser();
+            if (contextCounter >= MAX_CONTEXTS) {
+                await reset_browser();
+            }
 
-            ctx = await init_browser(task.proxy || null);
+            ctx = await init_browser(proxyObj);
             contextCounter++;
 
             let result;
             if (method === "turnstile") {
-                // Memanggil turnstile.js (Injection)
-                result = await turnstile({ domain, siteKey }, ctx.page);
-            } else {
-                result = await interstitial({ domain, payload: task.payload || null }, ctx.page); 
+                result = await turnstile({ domain, siteKey, action, cdata, pagedata }, ctx.page);
+            } else if (method === "interstitial") {
+                result = await interstitial({ domain, payload }, ctx.page); 
             }
 
             const solution = {};
             if (method === "turnstile") {
                 solution.token = result.token;
-            } else {
+            } else if (method === "interstitial") {
                 solution.cf_clearance = result.solution?.clearance || "";
                 solution.user_agent = result.solution?.user_agent || "";
+                if (result.solution?.__cf_bm) {
+                    solution.__cf_bm = result.solution.__cf_bm;
+                }
             }
 
             tasks[newTaskId] = { 
                 status: "ready", 
                 taskId: newTaskId,
-                solution: solution,
-                createdAt: Date.now()
+                solution: solution
             };
+            
+            setTimeout(() => { delete tasks[newTaskId]; }, 120000);
 
         } catch (err) {
             console.error(`[Task ${newTaskId}] Solver error:`, err);
+
+            const usr = err.usr || "ERROR_CAPTCHA_UNSOLVABLE";
+            const api = err.api || err.message || String(err);
+            
             tasks[newTaskId] = {
                 status: "error",
                 taskId: newTaskId,
-                err: { usr: err.usr || "ERROR_CAPTCHA_UNSOLVABLE", api: err.api || err.message || String(err) } 
+                err: {
+                    usr: usr,
+                    api: api,
+                    msg: usr === "ERROR_CAPTCHA_UNSOLVABLE" ? "Internal solver error occurred, please try again later" : "Solver encountered an error."
+                } 
             };
+
+            setTimeout(() => { delete tasks[newTaskId]; }, 10000);
+
         } finally {
             activeTasks--;
+            
             setTimeout(async () => {
                 try {
                     if (ctx) {
                         if (ctx.page) await ctx.page.close().catch(() => {});
-                        if (ctx.context) await ctx.context.close().catch(() => {});
+                        if (ctx.context) {
+                            await ctx.context.close().catch(() => {});
+                        }
                     }
-                } catch (err) { /* ignore */ }
-            }, 5000); // Beri waktu 5 detik sebelum context dihancurkan
+                } catch (err) {
+                    console.error(`[Task ${newTaskId}] cleanup failed`, err.message);
+                }
+            }, 8000);
         }
     })();
 });
 
-// ── GLOBAL ERROR HANDLER ──
 app.use((err, req, res, next) => {
     console.error(err.stack);
-    res.status(500).json({ status: "error", err: { usr: "INTERNAL_SERVER_ERROR", api: err.message } });
+    res.status(500).json({
+        status: "error",
+        err: {
+            usr: "INTERNAL_SERVER_ERROR",
+            api: err.message || "Express global crash intercept",
+            msg: "An unexpected error occurred on the server."
+        }
+    });
 });
 
 app.listen(port, '0.0.0.0', () => {
@@ -221,7 +357,10 @@ app.listen(port, '0.0.0.0', () => {
 });
 
 const cleanup = async (code) => {
-    if (browser) await browser.close().catch(() => {});
+    console.log(`(code: ${code}). Cleaning up...`);
+    if (browser) {
+        try { await browser.close(); } catch (e) { console.error("Error closing browser:", e.message); }
+    }
     process.exit(code);
 };
 
