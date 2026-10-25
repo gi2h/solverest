@@ -13,7 +13,7 @@ from turnstile_solver1 import solve_turnstile, solve_recaptcha, get_cloudflare_c
 
 app = FastAPI(title="Fortress Captcha Solver")
 
-# Task Store
+# Task Store.
 class TaskResult(BaseModel):
     id: str
     status: str          # pending | done | failed
