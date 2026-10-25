@@ -1,22 +1,14 @@
-FROM node:20-slim
-
-RUN apt-get update && apt-get install -y \
-    wget gnupg ca-certificates xvfb \
-    fonts-liberation libappindicator3-1 libasound2 libatk-bridge2.0-0 \
-    libatk1.0-0 libxss1 libnss3 libxcomposite1 libxdamage1 libxrandr2 libgbm1 \
-    && wget https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb \
-    && apt-get install -y ./google-chrome-stable_current_amd64.deb \
-    && rm google-chrome-stable_current_amd64.deb \
-    && rm -rf /var/lib/apt/lists/*
-
-WORKDIR /A
-
-COPY package*.json ./
-
-RUN npm ci --omit=dev
-
-COPY . .
-
-EXPOSE 7860
-
-CMD ["sh", "-c", "rm -f /tmp/.X99-lock && Xvfb :99 -screen 0 1024x768x24 & export DISPLAY=:99 && exec npm start"]
+FROM ubuntu:22.04
+ENV DEBIAN_FRONTEND=noninteractive
+ENV PORT=8080
+ENV DISPLAY=:99
+RUN apt-get update && apt-get install -y python3 python3-pip xvfb wget curl gnupg libnss3 libatk-bridge2.0-0 libdrm2 libxkbcommon0 libxcomposite1 libxdamage1 libxfixes3 libxrandr2 libgbm1 libasound2 && rm -rf /var/lib/apt/lists/*
+WORKDIR /app
+COPY requirements.txt .
+RUN pip3 install --no-cache-dir -r requirements.txt
+RUN patchright install chromium || true
+RUN playwright install chromium || true
+COPY solver.py .
+RUN echo '#!/bin/bash\nXvfb :99 -screen 0 1920x1080x24 & \nsleep 2\npython3 solver.py' > /app/start.sh && chmod +x /app/start.sh
+EXPOSE 8080
+CMD ["/app/start.sh"]
